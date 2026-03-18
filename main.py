@@ -1,22 +1,15 @@
 """
-BTCUSD Live Trading Bot - 1 MIN CANDLES - FINAL CLEAN VERSION
+BTCUSD Live Trading Bot - 1 MIN CANDLES
 Exchange  : Delta Exchange India
 Leverage  : 50x  |  Contracts: 1 (minimum)
 
-FIXES:
-  - No balance API calls (401 error)
-  - No positions API calls in dashboard (401 error)
-  - Clock synced candles match Delta Exchange chart
-  - Only places order when signal fires
-  - Tracks open trades internally
+CANDLE INDEX FIX:
+  candles[-1] = currently forming (live)
+  candles[-2] = last closed candle  = CURR in signal check
+  candles[-3] = candle before that  = PREV in signal check
 
-BUY  : PrevRED + CurrGREEN + Close>PrevHigh + Close>EMA9
-       SL = Green candle LOW
-       TP = Entry + (Entry - SL) x 1.5
-
-SELL : PrevGREEN + CurrRED + Close<PrevLow
-       SL = Red candle HIGH
-       TP = Entry - (SL - Entry) x 1.5
+BUY  : PREV RED + CURR GREEN + CURR close > PREV high + CURR close > EMA9
+SELL : PREV GREEN + CURR RED + CURR close < PREV low
 """
 
 import time
@@ -54,8 +47,8 @@ last_price      = None
 last_signal_id  = -1
 product_id      = None
 daily_loss      = 0.0
-session_trades  = []   # internal trade tracking
-open_trades     = []   # internally tracked open trades
+session_trades  = []
+open_trades     = []
 last_trade_time = 0
 trades_today    = 0
 current_minute  = -1
@@ -116,7 +109,6 @@ def http_post(path, payload, timeout=5):
         return None
 
 
-# PRICE — public endpoint, no auth needed
 def get_price():
     global last_price
     d = http_pub(TICKER_URL, timeout=4)
@@ -158,7 +150,7 @@ def set_leverage(pid):
     if d and d.get("success"):
         log("  Leverage set to {}x".format(LEVERAGE))
         return True
-    log("  [WARN] Leverage set failed: {}".format(d))
+    log("  [WARN] Leverage set: {}".format(d))
     return False
 
 
@@ -199,8 +191,6 @@ def place_order(side, entry, sl, tp, pid):
 
 
 # ── INTERNAL TRADE TRACKER ──────────────────
-# Since positions API returns 401,
-# we track trades internally using price
 def update_open_trades(price):
     global open_trades, daily_loss
     still_open = []
@@ -208,27 +198,21 @@ def update_open_trades(price):
         if t["side"] == "buy":
             if price >= t["tp"]:
                 pnl = round(t["tp"] - t["entry"], 2)
-                t["status"] = "TP"
-                daily_loss  = round(daily_loss - pnl, 2)
-                log("  [INTERNAL] BUY TP HIT #{} PNL=+${}".format(t["id"], pnl))
+                log("  [TP HIT] BUY #{} PNL=+${}".format(t["id"], pnl))
             elif price <= t["sl"]:
                 pnl = round(t["entry"] - t["sl"], 2)
-                t["status"] = "SL"
-                daily_loss  = round(daily_loss + pnl, 2)
-                log("  [INTERNAL] BUY SL HIT #{} PNL=-${}".format(t["id"], pnl))
+                daily_loss = round(daily_loss + pnl, 2)
+                log("  [SL HIT] BUY #{} PNL=-${}".format(t["id"], pnl))
             else:
                 still_open.append(t)
-        else:  # sell
+        else:
             if price <= t["tp"]:
                 pnl = round(t["entry"] - t["tp"], 2)
-                t["status"] = "TP"
-                daily_loss  = round(daily_loss - pnl, 2)
-                log("  [INTERNAL] SELL TP HIT #{} PNL=+${}".format(t["id"], pnl))
+                log("  [TP HIT] SELL #{} PNL=+${}".format(t["id"], pnl))
             elif price >= t["sl"]:
                 pnl = round(t["entry"] - t["sl"], 2)
-                t["status"] = "SL"
-                daily_loss  = round(daily_loss + pnl, 2)
-                log("  [INTERNAL] SELL SL HIT #{} PNL=-${}".format(t["id"], pnl))
+                daily_loss = round(daily_loss + pnl, 2)
+                log("  [SL HIT] SELL #{} PNL=-${}".format(t["id"], pnl))
             else:
                 still_open.append(t)
     open_trades = still_open
@@ -301,44 +285,69 @@ def sell_sl_tp(candle):
 
 
 def check_signals():
-    if len(candles) < 3:
-        log("  [SKIP] Need {} more candles".format(3 - len(candles)))
+    """
+    candles list:
+      index -1 = currently forming candle (not used)
+      index -2 = CURR = last fully closed candle
+      index -3 = PREV = candle before CURR
+    """
+    if len(candles) < 2:
+        log("  [SKIP] Need more candles ({})".format(len(candles)))
         return None, None, None, None, None, None, None
 
-    prev   = candles[-3]
-    curr   = candles[-2]
-    closes = [c["close"] for c in candles[:-1]]
+    curr = candles[-1]   # last closed candle
+    prev = candles[-2]   # candle before that
+
+    closes = [c["close"] for c in candles]
     ema9   = calc_ema(closes, EMA_PERIOD)
 
-    buy_ok = (
-        prev["close"] < prev["open"] and
-        curr["close"] > curr["open"] and
-        curr["close"] > prev["high"] and
-        ema9 is not None and curr["close"] > ema9
-    )
-    sell_ok = (
-        prev["close"] > prev["open"] and
-        curr["close"] < curr["open"] and
-        curr["close"] < prev["low"]
-    )
+    # Detailed condition values for debugging
+    prev_is_red   = prev["close"] < prev["open"]
+    prev_is_green = prev["close"] > prev["open"]
+    curr_is_green = curr["close"] > curr["open"]
+    curr_is_red   = curr["close"] < curr["open"]
+    engulf_buy    = curr["close"] > prev["high"]
+    engulf_sell   = curr["close"] < prev["low"]
+    above_ema     = (ema9 is not None) and (curr["close"] > ema9)
+    below_ema_val = ema9 if ema9 else 0
 
-    log("  [BUY]  PrevRED:{} CurrGREEN:{} Engulf:{} AboveEMA:{}".format(
-        "Y" if prev["close"] < prev["open"]    else "N",
-        "Y" if curr["close"] > curr["open"]    else "N",
-        "Y" if curr["close"] > prev["high"]    else "N",
-        "Y" if (ema9 and curr["close"] > ema9) else "N"))
-    log("  [SELL] PrevGREEN:{} CurrRED:{} BelowPrevLow:{}".format(
-        "Y" if prev["close"] > prev["open"]    else "N",
-        "Y" if curr["close"] < curr["open"]    else "N",
-        "Y" if curr["close"] < prev["low"]     else "N"))
+    log("  PREV: O={} H={} L={} C={} [{}]".format(
+        prev["open"], prev["high"], prev["low"],
+        prev["close"], prev["color"]))
+    log("  CURR: O={} H={} L={} C={} [{}]".format(
+        curr["open"], curr["high"], curr["low"],
+        curr["close"], curr["color"]))
+    log("  EMA9: {}".format(round(ema9, 2) if ema9 else "N/A"))
+
+    log("  [BUY CHECK]")
+    log("    PrevRED:{}  CurrGREEN:{}  Close({})>PrevHigh({}):{}  Close>EMA9({}):{}".format(
+        "Y" if prev_is_red   else "N",
+        "Y" if curr_is_green else "N",
+        curr["close"], prev["high"],
+        "Y" if engulf_buy  else "N",
+        round(below_ema_val, 2),
+        "Y" if above_ema   else "N"))
+
+    log("  [SELL CHECK]")
+    log("    PrevGREEN:{}  CurrRED:{}  Close({})>PrevLow({}):{}".format(
+        "Y" if prev_is_green else "N",
+        "Y" if curr_is_red   else "N",
+        curr["close"], prev["low"],
+        "Y" if engulf_sell  else "N"))
+
+    buy_ok  = prev_is_red   and curr_is_green and engulf_buy  and above_ema
+    sell_ok = prev_is_green and curr_is_red   and engulf_sell
 
     if buy_ok:
         entry, sl, tp, risk, reward = buy_sl_tp(curr)
-        log("  >>> BUY! E={} SL={} TP={} Risk=${}".format(entry, sl, tp, risk))
+        log("  >>> BUY SIGNAL! E={} SL={} TP={} Risk=${}".format(
+            entry, sl, tp, risk))
         return "buy", entry, sl, tp, risk, reward, ema9
+
     if sell_ok:
         entry, sl, tp, risk, reward = sell_sl_tp(curr)
-        log("  >>> SELL! E={} SL={} TP={} Risk=${}".format(entry, sl, tp, risk))
+        log("  >>> SELL SIGNAL! E={} SL={} TP={} Risk=${}".format(
+            entry, sl, tp, risk))
         return "sell", entry, sl, tp, risk, reward, ema9
 
     log("  [NO SIGNAL]")
@@ -350,10 +359,10 @@ def safety_check(risk):
         log("  [SAFETY] Max {} trades open.".format(MAX_OPEN_TRADES))
         return False
     if daily_loss >= MAX_LOSS_PER_DAY_USD:
-        log("  [SAFETY] Daily loss ${}. Limit hit!".format(daily_loss))
+        log("  [SAFETY] Daily loss limit hit!")
         return False
     if trades_today >= MAX_TRADES_PER_DAY:
-        log("  [SAFETY] Max {}/day reached.".format(MAX_TRADES_PER_DAY))
+        log("  [SAFETY] Max {}/day.".format(MAX_TRADES_PER_DAY))
         return False
     since_last = time.time() - last_trade_time
     if since_last < MIN_COOLDOWN_SEC:
@@ -398,7 +407,7 @@ def dashboard(price, candle_count, ema9):
     log("=" * 62)
     log("  PRICE    : ${}".format(price))
     log("  EMA9     : ${}".format(round(ema9, 2) if ema9 else "warming..."))
-    log("  BALANCE  : Check Delta app manually")
+    log("  BALANCE  : Check Delta app")
     log("  NEXT     : {}s  |  CANDLES: {}".format(sec_left, candle_count))
     log("  TODAY    : {} trades (max {})  LOSS: ${} (max ${})".format(
         trades_today, MAX_TRADES_PER_DAY,
@@ -412,9 +421,14 @@ def dashboard(price, candle_count, ema9):
         log("  FORMING : O={} H={} L={} C={} [{}]".format(
             cc["open"], cc["high"], cc["low"], price, cc["color"]))
         log("  PROGRESS: [{}] {}%  Ticks={}".format(bar, pct, cc["ticks"]))
+    if len(candles) >= 2:
+        last = candles[-1]
+        log("  LAST CLOSED: O={} H={} L={} C={} [{}]".format(
+            last["open"], last["high"], last["low"],
+            last["close"], last["color"]))
     log("-" * 62)
     if open_trades:
-        log("  OPEN TRADES (internal tracker):")
+        log("  OPEN TRADES:")
         for t in open_trades:
             unreal = round(
                 (price - t["entry"]) if t["side"] == "buy"
@@ -422,8 +436,7 @@ def dashboard(price, candle_count, ema9):
             sign = "+" if unreal >= 0 else ""
             log("  #{} [{}] E=${} SL=${} TP=${} PNL:{}${}".format(
                 t["id"], t["side"].upper(),
-                t["entry"], t["sl"], t["tp"],
-                sign, unreal))
+                t["entry"], t["sl"], t["tp"], sign, unreal))
     else:
         log("  No open trades.")
     if session_trades:
@@ -441,14 +454,12 @@ def run():
 
     log("=" * 62)
     log("  DELTA EXCHANGE INDIA - BTCUSD 1MIN LIVE BOT")
-    log("  CLOCK SYNCED + NO POSITION/BALANCE API CALLS")
-    log("  Leverage:{}x  Contracts:{}".format(LEVERAGE, CONTRACTS))
-    log("  MaxSL:${}  Cooldown:{}s  MaxTrades:{}/day".format(
-        MAX_SL_USD, MIN_COOLDOWN_SEC, MAX_TRADES_PER_DAY))
+    log("  Leverage:{}x  MaxSL:${}  Cooldown:{}s".format(
+        LEVERAGE, MAX_SL_USD, MIN_COOLDOWN_SEC))
     log("=" * 62)
 
     if not API_KEY or not API_SECRET:
-        log("  [ERR] API_KEY or API_SECRET missing!")
+        log("  [ERR] API keys missing!")
         return
 
     log("  API keys loaded OK.")
@@ -480,9 +491,8 @@ def run():
 
     sec_left = 60 - datetime.now().second
     log("\n  *** BOT IS LIVE ***")
-    log("  Clock synced - no 401 errors")
     log("  Next candle close in {}s".format(sec_left))
-    log("  Price check every {}s\n".format(FETCH_EVERY_SEC))
+    log("  Detailed signal logs on every candle close\n")
 
     while True:
         try:
@@ -491,18 +501,13 @@ def run():
                 time.sleep(5)
                 continue
 
-            # Update EMA
             if len(candles) >= EMA_PERIOD:
                 closes    = [c["close"] for c in candles]
                 last_ema9 = calc_ema(closes, EMA_PERIOD)
 
-            # Update forming candle
             update_candle(price)
-
-            # Update internal trade tracker
             update_open_trades(price)
 
-            # Check minute boundary
             this_minute = get_current_minute()
 
             if this_minute != current_minute:
@@ -516,8 +521,7 @@ def run():
                 candle_count   = len(candles)
 
                 if closed:
-                    log("  [1MIN #{}] O={} H={} L={} C={} [{}] Range=${}".format(
-                        candle_count,
+                    log("  CLOSED: O={} H={} L={} C={} [{}] Range=${}".format(
                         closed["open"], closed["high"],
                         closed["low"],  closed["close"],
                         closed["color"],
@@ -536,7 +540,6 @@ def run():
                                 log("  Entry  : ${}".format(entry))
                                 log("  SL     : ${}  Risk  -${}".format(sl, risk))
                                 log("  TP     : ${}  Reward+${}".format(tp, reward))
-                                log("  R:R    : 1:1.5")
                                 log("  " + "*" * 48)
 
                                 order = place_order(
@@ -556,7 +559,7 @@ def run():
                                         "time":  datetime.now().strftime("%H:%M")
                                     }
                                     session_trades.append(new_trade)
-                                    open_trades.append(new_trade)
+                                    open_trades.append(dict(new_trade))
                                     log("  *** ORDER IS LIVE! ***")
 
             dashboard(price, candle_count, last_ema9)
@@ -564,7 +567,6 @@ def run():
 
         except KeyboardInterrupt:
             log("  Bot stopped.")
-            log("  Trades: {}  Loss: ${}".format(trades_today, daily_loss))
             break
         except Exception as e:
             log("  [ERR] {} - Retry in 5s...".format(e))
