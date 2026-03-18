@@ -1,61 +1,28 @@
 """
-BTCUSD Live Trading Bot - 1 MIN CANDLES
-Exchange  : Delta Exchange India
-Leverage  : 50x  |  Contracts: 1 (minimum)
+ORDER PLACEMENT TEST SCRIPT
+Delta Exchange India - BTCUSD
 
-FIX: MAX_SL_USD increased from $80 to $200
-     BTCUSD 1min candles typically range $30-$150
-     $80 was blocking most valid signals
+This script:
+1. Fetches live BTCUSD mark price
+2. Places ONE real BUY limit order with SL and TP
+3. Shows full API response
+4. Cancels the order immediately after
 
-BUY  : PREV RED + CURR GREEN + CURR close > PREV high + CURR close > EMA9
-       SL = Green candle LOW
-       TP = Entry + (Entry - SL) x 1.5
-
-SELL : PREV GREEN + CURR RED + CURR close < PREV low
-       SL = Red candle HIGH
-       TP = Entry - (SL - Entry) x 1.5
+Run this to verify API keys work for trading.
 """
 
 import time
 import json
 import hmac
 import hashlib
-import random
 import os
 import urllib.request
 from datetime import datetime
 
+# ── API KEYS ────────────────────────────────
 API_KEY    = os.environ.get("API_KEY",    "")
 API_SECRET = os.environ.get("API_SECRET", "")
-
-SYMBOL          = "BTCUSD"
-LEVERAGE        = 50
-CONTRACTS       = 1
-TP_RATIO        = 1.5
-EMA_PERIOD      = 9
-FETCH_EVERY_SEC = 5
-
-MAX_OPEN_TRADES      = 2
-MAX_TRADES_PER_DAY   = 10
-MAX_LOSS_PER_DAY_USD = 2.0
-MAX_SL_USD           = 200.0   # increased from $80 to $200
-MIN_COOLDOWN_SEC     = 60
-
-BASE_URL     = "https://api.india.delta.exchange"
-TICKER_URL   = "{}/v2/tickers/{}".format(BASE_URL, SYMBOL)
-PRODUCTS_URL = "{}/v2/products/{}".format(BASE_URL, SYMBOL)
-
-candles         = []
-current_candle  = None
-last_price      = None
-last_signal_id  = -1
-product_id      = None
-daily_loss      = 0.0
-session_trades  = []
-open_trades     = []
-last_trade_time = 0
-trades_today    = 0
-current_minute  = -1
+BASE_URL   = "https://api.india.delta.exchange"
 
 
 def log(msg):
@@ -84,19 +51,30 @@ def auth_headers(method, path, query="", body=""):
         "User-Agent":   "Mozilla/5.0"
     }
 
-def http_pub(url, timeout=4):
+def http_pub(url):
     try:
         req = urllib.request.Request(
             url,
             headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
         )
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with urllib.request.urlopen(req, timeout=6) as r:
             return json.loads(r.read().decode())
     except Exception as e:
-        log("  [PUB ERR] {}".format(e))
+        log("  [ERR] {}".format(e))
         return None
 
-def http_post(path, payload, timeout=5):
+def http_get(path, query=""):
+    try:
+        h   = auth_headers("GET", path, query)
+        req = urllib.request.Request(
+            BASE_URL + path + query, headers=h)
+        with urllib.request.urlopen(req, timeout=6) as r:
+            return json.loads(r.read().decode())
+    except Exception as e:
+        log("  [ERR] {}".format(e))
+        return None
+
+def http_post(path, payload):
     try:
         body = json.dumps(payload)
         h    = auth_headers("POST", path, "", body)
@@ -106,461 +84,150 @@ def http_post(path, payload, timeout=5):
             headers=h,
             method="POST"
         )
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with urllib.request.urlopen(req, timeout=6) as r:
             return json.loads(r.read().decode())
     except Exception as e:
-        log("  [POST ERR] {}".format(e))
+        log("  [ERR] {}".format(e))
+        return None
+
+def http_delete(path, payload):
+    try:
+        body = json.dumps(payload)
+        h    = auth_headers("DELETE", path, "", body)
+        req  = urllib.request.Request(
+            BASE_URL + path,
+            data=body.encode(),
+            headers=h,
+            method="DELETE"
+        )
+        with urllib.request.urlopen(req, timeout=6) as r:
+            return json.loads(r.read().decode())
+    except Exception as e:
+        log("  [ERR] {}".format(e))
         return None
 
 
-def get_price():
-    global last_price
-    d = http_pub(TICKER_URL, timeout=4)
-    if d:
-        r = d.get("result", {})
-        p = (r.get("mark_price") or r.get("close") or
-             r.get("last_price") or r.get("spot_price"))
-        if p:
-            last_price = round(float(p), 2)
-            return last_price
-    if last_price:
-        last_price = round(
-            last_price * (1 + random.uniform(-0.0001, 0.0001)), 2)
-        return last_price
-    return None
+log("=" * 60)
+log("  DELTA EXCHANGE INDIA - ORDER TEST")
+log("=" * 60)
 
+# ── STEP 1: Validate keys ───────────────────
+if not API_KEY or not API_SECRET:
+    log("  [ERR] API_KEY or API_SECRET not set!")
+    log("  Set them in Railway Variables tab.")
+    exit()
+log("  API Key: {}...{}".format(API_KEY[:4], API_KEY[-4:]))
 
-def get_product_id():
-    d = http_pub(PRODUCTS_URL, timeout=6)
-    if d:
-        pid = d.get("result", {}).get("id")
-        if pid:
-            log("  Product ID: {}".format(pid))
-            return pid
-    d = http_pub("{}/v2/products".format(BASE_URL), timeout=6)
+# ── STEP 2: Get live price ──────────────────
+log("\n  STEP 1: Fetching live BTCUSD mark price...")
+d = http_pub("{}/v2/tickers/BTCUSD".format(BASE_URL))
+if not d:
+    log("  [ERR] Cannot fetch price!")
+    exit()
+
+result = d.get("result", {})
+price  = float(result.get("mark_price") or result.get("close") or 0)
+if not price:
+    log("  [ERR] No price in response: {}".format(result))
+    exit()
+log("  Live BTCUSD: ${}".format(price))
+
+# ── STEP 3: Get product ID ──────────────────
+log("\n  STEP 2: Getting BTCUSD product ID...")
+d = http_pub("{}/v2/products/BTCUSD".format(BASE_URL))
+pid = None
+if d:
+    pid = d.get("result", {}).get("id")
+if not pid:
+    # search all products
+    d = http_pub("{}/v2/products".format(BASE_URL))
     if d:
         for p in d.get("result", []):
-            if p.get("symbol") == SYMBOL:
-                log("  Product ID: {}".format(p["id"]))
-                return p["id"]
-    return None
+            if p.get("symbol") == "BTCUSD":
+                pid = p["id"]
+                break
+if not pid:
+    log("  [ERR] Cannot find product ID!")
+    exit()
+log("  Product ID: {}".format(pid))
 
+# ── STEP 4: Set leverage ────────────────────
+log("\n  STEP 3: Setting leverage to 50x...")
+d = http_post("/v2/products/leverage", {
+    "product_id": pid,
+    "leverage":   "50"
+})
+if d and d.get("success"):
+    log("  Leverage set to 50x OK")
+else:
+    log("  [WARN] Leverage response: {}".format(d))
 
-def set_leverage(pid):
-    d = http_post("/v2/products/leverage", {
-        "product_id": pid,
-        "leverage":   str(LEVERAGE)
-    }, timeout=6)
-    if d and d.get("success"):
-        log("  Leverage set to {}x".format(LEVERAGE))
-        return True
-    log("  [WARN] Leverage: {}".format(d))
-    return False
+# ── STEP 5: Calculate test order levels ─────
+log("\n  STEP 4: Calculating test order levels...")
 
+# Place a BUY limit order BELOW current price
+# so it won't fill immediately (safe test)
+entry = round(price * 0.995, 1)    # 0.5% below current price
+sl    = round(entry - 50, 1)       # $50 below entry
+tp    = round(entry + 75, 1)       # $75 above entry (1:1.5)
 
-def place_order(side, entry, sl, tp, pid):
-    if side == "buy":
-        lp     = round(entry * 1.0003, 2)
-        sl_lim = round(sl    * 0.9995, 2)
-        tp_lim = round(tp    * 0.9995, 2)
+log("  Current price : ${}".format(price))
+log("  Test entry    : ${} (0.5% below market - won't fill)".format(entry))
+log("  Test SL       : ${}".format(sl))
+log("  Test TP       : ${}".format(tp))
+
+# ── STEP 6: Place bracket order ─────────────
+log("\n  STEP 5: Placing test bracket order...")
+payload = {
+    "product_id":                      pid,
+    "size":                            1,
+    "side":                            "buy",
+    "order_type":                      "limit_order",
+    "limit_price":                     str(entry),
+    "bracket_stop_loss_price":         str(sl),
+    "bracket_stop_loss_limit_price":   str(round(sl - 1, 1)),
+    "bracket_take_profit_price":       str(tp),
+    "bracket_take_profit_limit_price": str(round(tp - 1, 1)),
+    "time_in_force":                   "gtc"
+}
+
+log("  Payload: {}".format(json.dumps(payload, indent=2)))
+
+d = http_post("/v2/orders", payload)
+log("\n  Full API Response:")
+log(json.dumps(d, indent=2))
+
+if not d:
+    log("\n  [RESULT] No response from API!")
+elif d.get("success"):
+    order_id = d.get("result", {}).get("id")
+    state    = d.get("result", {}).get("state")
+    log("\n  [SUCCESS] Order placed!")
+    log("  Order ID : {}".format(order_id))
+    log("  State    : {}".format(state))
+
+    # ── STEP 7: Cancel immediately ───────────
+    log("\n  STEP 6: Cancelling test order immediately...")
+    time.sleep(2)
+    c = http_delete("/v2/orders/{}".format(order_id), {
+        "product_id": pid
+    })
+    log("  Cancel response: {}".format(c))
+    if c and c.get("success"):
+        log("  [SUCCESS] Order cancelled. No real trade placed.")
     else:
-        lp     = round(entry * 0.9997, 2)
-        sl_lim = round(sl    * 1.0005, 2)
-        tp_lim = round(tp    * 1.0005, 2)
+        log("  [WARN] Could not cancel. Check Delta app and cancel manually!")
+        log("  Order ID to cancel: {}".format(order_id))
+else:
+    error = d.get("error", {})
+    code  = error.get("code", "unknown") if isinstance(error, dict) else error
+    msg   = error.get("context", "") if isinstance(error, dict) else ""
+    log("\n  [FAILED] Order placement failed!")
+    log("  Error code : {}".format(code))
+    log("  Message    : {}".format(msg))
+    log("  Full error : {}".format(d))
 
-    payload = {
-        "product_id":                      pid,
-        "size":                            CONTRACTS,
-        "side":                            side,
-        "order_type":                      "limit_order",
-        "limit_price":                     str(lp),
-        "bracket_stop_loss_price":         str(sl),
-        "bracket_stop_loss_limit_price":   str(sl_lim),
-        "bracket_take_profit_price":       str(tp),
-        "bracket_take_profit_limit_price": str(tp_lim),
-        "time_in_force":                   "gtc"
-    }
-    log("  Placing {} bracket: E={} SL={} TP={}".format(
-        side.upper(), lp, sl, tp))
-    d = http_post("/v2/orders", payload, timeout=5)
-    if d:
-        if d.get("success"):
-            o = d.get("result", {})
-            log("  ORDER LIVE! ID={} Status={}".format(
-                o.get("id"), o.get("state")))
-            return o
-        else:
-            log("  [ORDER FAIL] {}".format(d.get("error", d)))
-    return None
-
-
-def update_open_trades(price):
-    global open_trades, daily_loss
-    still_open = []
-    for t in open_trades:
-        if t["side"] == "buy":
-            if price >= t["tp"]:
-                pnl = round(t["tp"] - t["entry"], 2)
-                log("  [TP HIT] BUY #{} +${}".format(t["id"], pnl))
-            elif price <= t["sl"]:
-                pnl = round(t["entry"] - t["sl"], 2)
-                daily_loss = round(daily_loss + pnl, 2)
-                log("  [SL HIT] BUY #{} -${}".format(t["id"], pnl))
-            else:
-                still_open.append(t)
-        else:
-            if price <= t["tp"]:
-                pnl = round(t["entry"] - t["tp"], 2)
-                log("  [TP HIT] SELL #{} +${}".format(t["id"], pnl))
-            elif price >= t["sl"]:
-                pnl = round(t["entry"] - t["sl"], 2)
-                daily_loss = round(daily_loss + pnl, 2)
-                log("  [SL HIT] SELL #{} -${}".format(t["id"], pnl))
-            else:
-                still_open.append(t)
-    open_trades = still_open
-
-
-def get_current_minute():
-    return datetime.now().minute
-
-def start_candle(price):
-    global current_candle
-    current_candle = {
-        "open":   price, "high": price,
-        "low":    price, "close": price,
-        "color":  "GREEN", "ticks": 1,
-        "minute": get_current_minute()
-    }
-
-def update_candle(price):
-    global current_candle
-    if current_candle is None:
-        start_candle(price)
-        return
-    current_candle["high"]  = max(current_candle["high"], price)
-    current_candle["low"]   = min(current_candle["low"],  price)
-    current_candle["close"] = price
-    current_candle["color"] = "GREEN" if price >= current_candle["open"] else "RED"
-    current_candle["ticks"] += 1
-
-def close_and_new_candle(price):
-    global current_candle, candles
-    if current_candle is None:
-        start_candle(price)
-        return None
-    current_candle["close"] = price
-    current_candle["color"] = "GREEN" if price >= current_candle["open"] else "RED"
-    closed = dict(current_candle)
-    candles.append(closed)
-    if len(candles) > 500:
-        candles.pop(0)
-    start_candle(price)
-    return closed
-
-
-def calc_ema(closes, period):
-    if len(closes) < period:
-        return None
-    k   = 2.0 / (period + 1)
-    ema = sum(closes[:period]) / period
-    for p in closes[period:]:
-        ema = p * k + ema * (1 - k)
-    return ema
-
-
-def buy_sl_tp(candle):
-    entry  = candle["close"]
-    sl     = candle["low"]
-    risk   = round(entry - sl, 2)
-    tp     = round(entry + risk * TP_RATIO, 2)
-    reward = round(risk * TP_RATIO, 2)
-    return entry, sl, tp, risk, reward
-
-def sell_sl_tp(candle):
-    entry  = candle["close"]
-    sl     = candle["high"]
-    risk   = round(sl - entry, 2)
-    tp     = round(entry - risk * TP_RATIO, 2)
-    reward = round(risk * TP_RATIO, 2)
-    return entry, sl, tp, risk, reward
-
-
-def check_signals():
-    if len(candles) < 2:
-        log("  [SKIP] Need 2 closed candles, have {}".format(len(candles)))
-        return None, None, None, None, None, None, None
-
-    curr = candles[-1]
-    prev = candles[-2]
-
-    closes = [c["close"] for c in candles]
-    ema9   = calc_ema(closes, EMA_PERIOD)
-
-    c1_buy  = prev["close"] < prev["open"]
-    c2_buy  = curr["close"] > curr["open"]
-    c3_buy  = curr["close"] > prev["high"]
-    c4_buy  = ema9 is not None and curr["close"] > ema9
-
-    c1_sell = prev["close"] > prev["open"]
-    c2_sell = curr["close"] < curr["open"]
-    c3_sell = curr["close"] < prev["low"]
-
-    buy_ok  = c1_buy  and c2_buy  and c3_buy  and c4_buy
-    sell_ok = c1_sell and c2_sell and c3_sell
-
-    log("  PREV: O={} H={} L={} C={} [{}]".format(
-        prev["open"], prev["high"], prev["low"], prev["close"], prev["color"]))
-    log("  CURR: O={} H={} L={} C={} [{}]".format(
-        curr["open"], curr["high"], curr["low"], curr["close"], curr["color"]))
-    log("  EMA9: {}".format(round(ema9, 2) if ema9 else "not ready"))
-    log("  BUY  [{}] PrevRED:{} CurrGREEN:{} Engulf:{} AboveEMA:{}".format(
-        "PASS" if buy_ok else "FAIL",
-        "Y" if c1_buy else "N",
-        "Y" if c2_buy else "N",
-        "Y({}>{})" .format(curr["close"], prev["high"]) if c3_buy  else "N({}<{})".format(curr["close"], prev["high"]),
-        "Y({}>{})" .format(curr["close"], round(ema9,2) if ema9 else "?") if c4_buy else "N"))
-    log("  SELL [{}] PrevGREEN:{} CurrRED:{} Engulf:{}".format(
-        "PASS" if sell_ok else "FAIL",
-        "Y" if c1_sell else "N",
-        "Y" if c2_sell else "N",
-        "Y({}<{})".format(curr["close"], prev["low"]) if c3_sell else "N({}>={})".format(curr["close"], prev["low"])))
-
-    if buy_ok:
-        entry, sl, tp, risk, reward = buy_sl_tp(curr)
-        log("  >>> BUY! E={} SL={} TP={} Risk=${}".format(entry, sl, tp, risk))
-        return "buy", entry, sl, tp, risk, reward, ema9
-
-    if sell_ok:
-        entry, sl, tp, risk, reward = sell_sl_tp(curr)
-        log("  >>> SELL! E={} SL={} TP={} Risk=${}".format(entry, sl, tp, risk))
-        return "sell", entry, sl, tp, risk, reward, ema9
-
-    return None, None, None, None, None, None, ema9
-
-
-def safety_check(risk):
-    if len(open_trades) >= MAX_OPEN_TRADES:
-        log("  [BLOCK] Max {} trades open.".format(MAX_OPEN_TRADES))
-        return False
-    if daily_loss >= MAX_LOSS_PER_DAY_USD:
-        log("  [BLOCK] Daily loss ${}.".format(daily_loss))
-        return False
-    if trades_today >= MAX_TRADES_PER_DAY:
-        log("  [BLOCK] Max {}/day.".format(MAX_TRADES_PER_DAY))
-        return False
-    since_last = time.time() - last_trade_time
-    if since_last < MIN_COOLDOWN_SEC:
-        log("  [BLOCK] Cooldown {}s left.".format(
-            int(MIN_COOLDOWN_SEC - since_last)))
-        return False
-    if risk > MAX_SL_USD:
-        log("  [BLOCK] SL ${} > max ${}. Skip.".format(risk, MAX_SL_USD))
-        return False
-    log("  [OK] All safety checks passed. Placing order...")
-    return True
-
-
-def seed_candles(seed_price, count=9):
-    global candles
-    p = seed_price
-    for _ in range(count):
-        vol     = p * 0.0008
-        open_p  = round(p, 2)
-        close_p = round(p + random.uniform(-vol, vol), 2)
-        high_p  = round(max(open_p, close_p) + random.uniform(0, vol * 0.3), 2)
-        low_p   = round(min(open_p, close_p) - random.uniform(0, vol * 0.3), 2)
-        color   = "GREEN" if close_p >= open_p else "RED"
-        candles.append({
-            "open": open_p, "high": high_p,
-            "low":  low_p,  "close": close_p,
-            "color": color, "ticks": 12, "minute": -1
-        })
-        p = close_p
-    log("  Seeded {} candles near ${}".format(count, seed_price))
-
-
-def dashboard(price, candle_count, ema9):
-    cc            = current_candle
-    now           = datetime.now()
-    sec_left      = 60 - now.second
-    cooldown_left = max(0, int(MIN_COOLDOWN_SEC - (time.time() - last_trade_time)))
-
-    log("\n" + "=" * 62)
-    log("  DELTA INDIA LIVE - BTCUSD 1MIN 50x | {}".format(
-        now.strftime("%d %b %Y  %H:%M:%S")))
-    log("=" * 62)
-    log("  PRICE    : ${}".format(price))
-    log("  EMA9     : ${}".format(round(ema9, 2) if ema9 else "warming..."))
-    log("  NEXT     : {}s  |  CANDLES: {}".format(sec_left, candle_count))
-    log("  TODAY    : {} trades (max {})  LOSS: ${} (max ${})".format(
-        trades_today, MAX_TRADES_PER_DAY,
-        round(daily_loss, 2), MAX_LOSS_PER_DAY_USD))
-    log("  COOLDOWN : {}  |  MAX SL: ${}".format(
-        "{}s left".format(cooldown_left) if cooldown_left > 0 else "READY",
-        MAX_SL_USD))
-    log("-" * 62)
-    if cc:
-        pct = min(100, int((60 - sec_left) / 60 * 100))
-        bar = "#" * (pct // 5) + "." * (20 - pct // 5)
-        log("  FORMING : O={} H={} L={} C={} [{}]".format(
-            cc["open"], cc["high"], cc["low"], price, cc["color"]))
-        log("  PROGRESS: [{}] {}%  Ticks={}".format(bar, pct, cc["ticks"]))
-    if len(candles) >= 2:
-        log("  CURR: O={} H={} L={} C={} [{}]".format(
-            candles[-1]["open"], candles[-1]["high"],
-            candles[-1]["low"],  candles[-1]["close"], candles[-1]["color"]))
-        log("  PREV: O={} H={} L={} C={} [{}]".format(
-            candles[-2]["open"], candles[-2]["high"],
-            candles[-2]["low"],  candles[-2]["close"], candles[-2]["color"]))
-    log("-" * 62)
-    if open_trades:
-        log("  OPEN TRADES:")
-        for t in open_trades:
-            unreal = round(
-                (price - t["entry"]) if t["side"] == "buy"
-                else (t["entry"] - price), 2)
-            s = "+" if unreal >= 0 else ""
-            log("  #{} [{}] E=${} SL=${} TP=${} PNL:{}${}".format(
-                t["id"], t["side"].upper(),
-                t["entry"], t["sl"], t["tp"], s, unreal))
-    else:
-        log("  No open trades.")
-    if session_trades:
-        log("  SESSION: {} trades".format(len(session_trades)))
-        for t in session_trades[-3:]:
-            log("  #{} [{}] E=${} SL=${} TP=${} @{}".format(
-                t["id"], t["side"].upper(),
-                t["entry"], t["sl"], t["tp"], t["time"]))
-    log("=" * 62)
-
-
-def run():
-    global last_signal_id, product_id
-    global last_trade_time, trades_today, current_minute
-
-    log("=" * 62)
-    log("  DELTA EXCHANGE INDIA - BTCUSD 1MIN LIVE BOT")
-    log("  Leverage:{}x  MAX SL:${}  Cooldown:{}s".format(
-        LEVERAGE, MAX_SL_USD, MIN_COOLDOWN_SEC))
-    log("  (MAX SL increased to ${} for BTCUSD 1min)".format(MAX_SL_USD))
-    log("=" * 62)
-
-    if not API_KEY or not API_SECRET:
-        log("  [ERR] API keys missing!")
-        return
-
-    log("  API keys loaded OK.")
-
-    log("\n  Getting product ID...")
-    product_id = get_product_id()
-    if not product_id:
-        log("  [ERR] Product not found.")
-        return
-
-    log("\n  Setting leverage {}x...".format(LEVERAGE))
-    set_leverage(product_id)
-
-    log("\n  Fetching live price...")
-    seed = get_price()
-    if not seed:
-        log("  [ERR] Cannot fetch price.")
-        return
-    log("  Live BTCUSD: ${}".format(seed))
-
-    log("\n  Seeding minimal EMA warmup candles...")
-    seed_candles(seed, count=9)
-
-    current_minute = get_current_minute()
-    start_candle(seed)
-    candle_count = len(candles)
-    last_ema9    = None
-    trade_count  = 0
-
-    sec_left = 60 - datetime.now().second
-    log("\n  *** BOT IS LIVE ***")
-    log("  Next candle close in {}s".format(sec_left))
-    log("  Signal check + full debug on every candle close\n")
-
-    while True:
-        try:
-            price = get_price()
-            if not price:
-                time.sleep(5)
-                continue
-
-            if len(candles) >= EMA_PERIOD:
-                closes    = [c["close"] for c in candles]
-                last_ema9 = calc_ema(closes, EMA_PERIOD)
-
-            update_candle(price)
-            update_open_trades(price)
-
-            this_minute = get_current_minute()
-
-            if this_minute != current_minute:
-                log("\n" + "=" * 62)
-                log("  CANDLE CLOSE :{} → :{}".format(
-                    str(current_minute).zfill(2),
-                    str(this_minute).zfill(2)))
-
-                closed         = close_and_new_candle(price)
-                current_minute = this_minute
-                candle_count   = len(candles)
-
-                if closed:
-                    log("  #{}  O={} H={} L={} C={} [{}] Range=${}".format(
-                        candle_count,
-                        closed["open"], closed["high"],
-                        closed["low"],  closed["close"],
-                        closed["color"],
-                        round(closed["high"] - closed["low"], 2)))
-
-                    if candle_count != last_signal_id:
-                        side, entry, sl, tp, risk, reward, ema9 = check_signals()
-                        if ema9:
-                            last_ema9 = ema9
-
-                        if side:
-                            if safety_check(risk):
-                                log("\n  " + "*" * 48)
-                                log("  *** {} TRADE #{} ***".format(
-                                    side.upper(), trade_count + 1))
-                                log("  Entry  : ${}".format(entry))
-                                log("  SL     : ${}  Risk -${}".format(sl, risk))
-                                log("  TP     : ${}  Reward+${}".format(tp, reward))
-                                log("  " + "*" * 48)
-
-                                order = place_order(
-                                    side, entry, sl, tp, product_id)
-
-                                if order:
-                                    last_signal_id  = candle_count
-                                    trade_count    += 1
-                                    trades_today   += 1
-                                    last_trade_time = time.time()
-                                    new_trade = {
-                                        "id":    trade_count,
-                                        "side":  side,
-                                        "entry": entry,
-                                        "sl":    sl,
-                                        "tp":    tp,
-                                        "time":  datetime.now().strftime("%H:%M")
-                                    }
-                                    session_trades.append(new_trade)
-                                    open_trades.append(dict(new_trade))
-                                    log("  *** ORDER IS LIVE! ***")
-
-            dashboard(price, candle_count, last_ema9)
-            time.sleep(FETCH_EVERY_SEC)
-
-        except KeyboardInterrupt:
-            log("  Bot stopped.")
-            break
-        except Exception as e:
-            log("  [ERR] {} - Retry in 5s...".format(e))
-            time.sleep(5)
-
-
-if __name__ == "__main__":
-    run()
+log("\n" + "=" * 60)
+log("  TEST COMPLETE")
+log("  Share the output above and we will fix any issues.")
+log("=" * 60)
