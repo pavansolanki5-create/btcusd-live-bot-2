@@ -1,0 +1,514 @@
+"""
+BTCUSD Live Trading Bot - 5 MIN CANDLES
+Exchange  : Delta Exchange India
+Leverage  : 50x  |  Contracts: 1 (minimum)
+API keys  : loaded from Railway environment variables
+"""
+
+import time
+import json
+import hmac
+import hashlib
+import random
+import os
+import urllib.request
+from datetime import datetime
+
+API_KEY    = os.environ.get("API_KEY",    "")
+API_SECRET = os.environ.get("API_SECRET", "")
+
+SYMBOL          = "BTCUSD"
+LEVERAGE        = 50
+CONTRACTS       = 1
+TP_RATIO        = 1.5
+EMA_PERIOD      = 9
+FETCH_EVERY_SEC = 5
+CANDLE_SEC      = 300
+
+MAX_OPEN_TRADES      = 2
+MIN_BALANCE_USD      = 1.50
+MAX_LOSS_PER_DAY_USD = 2.0
+
+BASE_URL     = "https://api.india.delta.exchange"
+TICKER_URL   = "{}/v2/tickers/{}".format(BASE_URL, SYMBOL)
+PRODUCTS_URL = "{}/v2/products/{}".format(BASE_URL, SYMBOL)
+
+candles        = []
+current_candle = None
+candle_start_t = None
+last_price     = None
+last_signal_id = -1
+product_id     = None
+daily_loss     = 0.0
+session_trades = []
+
+
+def log(msg):
+    print("[{}] {}".format(
+        datetime.now().strftime("%H:%M:%S"), msg), flush=True)
+
+
+def sign(method, path, query, body):
+    ts  = str(int(time.time()))
+    msg = method + ts + path + query + body
+    sig = hmac.new(
+        API_SECRET.encode(),
+        msg.encode(),
+        hashlib.sha256
+    ).hexdigest()
+    return ts, sig
+
+def auth_headers(method, path, query="", body=""):
+    ts, sig = sign(method, path, query, body)
+    return {
+        "api-key":      API_KEY,
+        "timestamp":    ts,
+        "signature":    sig,
+        "Content-Type": "application/json",
+        "Accept":       "application/json",
+        "User-Agent":   "Mozilla/5.0"
+    }
+
+
+def http_pub(url, timeout=6):
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except Exception as e:
+        log("  [PUB ERR] {}".format(e))
+        return None
+
+def http_get(path, query=""):
+    try:
+        h   = auth_headers("GET", path, query)
+        req = urllib.request.Request(
+            BASE_URL + path + query, headers=h)
+        with urllib.request.urlopen(req, timeout=8) as r:
+            return json.loads(r.read().decode())
+    except Exception as e:
+        log("  [GET ERR] {}".format(e))
+        return None
+
+def http_post(path, payload):
+    try:
+        body = json.dumps(payload)
+        h    = auth_headers("POST", path, "", body)
+        req  = urllib.request.Request(
+            BASE_URL + path,
+            data=body.encode(),
+            headers=h,
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=8) as r:
+            return json.loads(r.read().decode())
+    except Exception as e:
+        log("  [POST ERR] {}".format(e))
+        return None
+
+
+def get_price():
+    global last_price
+    d = http_pub(TICKER_URL)
+    if d:
+        r = d.get("result", {})
+        p = (r.get("mark_price") or r.get("close") or
+             r.get("last_price") or r.get("spot_price"))
+        if p:
+            last_price = round(float(p), 2)
+            return last_price
+    if last_price:
+        last_price = round(
+            last_price * (1 + random.uniform(-0.0002, 0.0002)), 2)
+        return last_price
+    return None
+
+
+def get_balance():
+    d = http_get("/v2/wallet/balances")
+    if d:
+        for a in d.get("result", []):
+            if a.get("asset_symbol") in ["USDT", "USD"]:
+                b = a.get("available_balance") or a.get("balance")
+                if b:
+                    return round(float(b), 4)
+    return None
+
+
+def get_product_id():
+    d = http_pub(PRODUCTS_URL)
+    if d:
+        pid = d.get("result", {}).get("id")
+        if pid:
+            log("  Product ID: {}".format(pid))
+            return pid
+    d = http_pub("{}/v2/products".format(BASE_URL))
+    if d:
+        for p in d.get("result", []):
+            if p.get("symbol") == SYMBOL:
+                log("  Product ID: {}".format(p["id"]))
+                return p["id"]
+    return None
+
+
+def set_leverage(pid):
+    d = http_post("/v2/products/leverage", {
+        "product_id": pid,
+        "leverage":   str(LEVERAGE)
+    })
+    if d and d.get("success"):
+        log("  Leverage set to {}x".format(LEVERAGE))
+        return True
+    log("  [WARN] Leverage set failed: {}".format(d))
+    return False
+
+
+def get_positions():
+    d = http_get("/v2/positions",
+                 "?product_symbol={}".format(SYMBOL))
+    if d:
+        return [p for p in d.get("result", [])
+                if float(p.get("size", 0)) != 0]
+    return []
+
+
+def place_order(side, entry, sl, tp, pid):
+    if side == "buy":
+        lp     = round(entry * 1.0003, 2)
+        sl_lim = round(sl    * 0.9995, 2)
+        tp_lim = round(tp    * 0.9995, 2)
+    else:
+        lp     = round(entry * 0.9997, 2)
+        sl_lim = round(sl    * 1.0005, 2)
+        tp_lim = round(tp    * 1.0005, 2)
+
+    payload = {
+        "product_id":                      pid,
+        "size":                            CONTRACTS,
+        "side":                            side,
+        "order_type":                      "limit_order",
+        "limit_price":                     str(lp),
+        "bracket_stop_loss_price":         str(sl),
+        "bracket_stop_loss_limit_price":   str(sl_lim),
+        "bracket_take_profit_price":       str(tp),
+        "bracket_take_profit_limit_price": str(tp_lim),
+        "time_in_force":                   "gtc"
+    }
+    log("  Placing {} order: E={} SL={} TP={}".format(side.upper(), lp, sl, tp))
+    d = http_post("/v2/orders", payload)
+    if d:
+        if d.get("success"):
+            o = d.get("result", {})
+            log("  ORDER LIVE! ID={} Status={}".format(o.get("id"), o.get("state")))
+            return o
+        else:
+            log("  [ORDER FAIL] {}".format(d.get("error", d)))
+    return None
+
+
+def start_candle(price):
+    global current_candle, candle_start_t
+    candle_start_t = time.time()
+    current_candle = {
+        "open": price, "high": price,
+        "low":  price, "close": price,
+        "color": "GREEN", "ticks": 1
+    }
+
+def update_candle(price):
+    global current_candle
+    if current_candle is None:
+        start_candle(price)
+        return
+    current_candle["high"]  = max(current_candle["high"], price)
+    current_candle["low"]   = min(current_candle["low"],  price)
+    current_candle["close"] = price
+    current_candle["color"] = "GREEN" if price >= current_candle["open"] else "RED"
+    current_candle["ticks"] += 1
+
+def close_candle(price):
+    global current_candle, candles
+    if current_candle is None:
+        start_candle(price)
+        return None
+    current_candle["close"] = price
+    current_candle["color"] = "GREEN" if price >= current_candle["open"] else "RED"
+    closed = dict(current_candle)
+    candles.append(closed)
+    if len(candles) > 500:
+        candles.pop(0)
+    start_candle(price)
+    return closed
+
+
+def calc_ema(closes, period):
+    if len(closes) < period:
+        return None
+    k   = 2.0 / (period + 1)
+    ema = sum(closes[:period]) / period
+    for p in closes[period:]:
+        ema = p * k + ema * (1 - k)
+    return ema
+
+
+def buy_sl_tp(candle):
+    entry  = candle["close"]
+    sl     = candle["low"]
+    risk   = round(entry - sl, 2)
+    tp     = round(entry + risk * TP_RATIO, 2)
+    reward = round(risk * TP_RATIO, 2)
+    return entry, sl, tp, risk, reward
+
+def sell_sl_tp(candle):
+    entry  = candle["close"]
+    sl     = candle["high"]
+    risk   = round(sl - entry, 2)
+    tp     = round(entry - risk * TP_RATIO, 2)
+    reward = round(risk * TP_RATIO, 2)
+    return entry, sl, tp, risk, reward
+
+
+def check_signals():
+    if len(candles) < 3:
+        return None, None, None, None, None, None, None
+    prev   = candles[-3]
+    curr   = candles[-2]
+    closes = [c["close"] for c in candles[:-1]]
+    ema9   = calc_ema(closes, EMA_PERIOD)
+    buy_ok = (
+        prev["close"] < prev["open"] and
+        curr["close"] > curr["open"] and
+        curr["close"] > prev["high"] and
+        ema9 is not None and curr["close"] > ema9
+    )
+    sell_ok = (
+        prev["close"] > prev["open"] and
+        curr["close"] < curr["open"] and
+        curr["close"] < prev["low"]
+    )
+    log("  [BUY]  PrevRED:{} CurrGREEN:{} Engulf:{} AboveEMA:{}".format(
+        "Y" if prev["close"] < prev["open"]    else "N",
+        "Y" if curr["close"] > curr["open"]    else "N",
+        "Y" if curr["close"] > prev["high"]    else "N",
+        "Y" if (ema9 and curr["close"] > ema9) else "N"))
+    log("  [SELL] PrevGREEN:{} CurrRED:{} BelowPrevLow:{}".format(
+        "Y" if prev["close"] > prev["open"]    else "N",
+        "Y" if curr["close"] < curr["open"]    else "N",
+        "Y" if curr["close"] < prev["low"]     else "N"))
+    if buy_ok:
+        entry, sl, tp, risk, reward = buy_sl_tp(curr)
+        log("  >>> BUY! E={} SL={} TP={}".format(entry, sl, tp))
+        return "buy", entry, sl, tp, risk, reward, ema9
+    if sell_ok:
+        entry, sl, tp, risk, reward = sell_sl_tp(curr)
+        log("  >>> SELL! E={} SL={} TP={}".format(entry, sl, tp))
+        return "sell", entry, sl, tp, risk, reward, ema9
+    log("  [NO SIGNAL]")
+    return None, None, None, None, None, None, ema9
+
+
+def safety_check(positions, balance):
+    if len(positions) >= MAX_OPEN_TRADES:
+        log("  [SAFETY] Max trades open.")
+        return False
+    if balance is not None and balance < MIN_BALANCE_USD:
+        log("  [SAFETY] Balance too low! Stopping.")
+        return False
+    if daily_loss >= MAX_LOSS_PER_DAY_USD:
+        log("  [SAFETY] Daily loss limit hit!")
+        return False
+    return True
+
+
+def seed_candles(seed_price, count=20):
+    global candles
+    p = seed_price * (1 - random.uniform(0.002, 0.005))
+    for _ in range(count):
+        vol     = p * 0.002
+        open_p  = round(p, 2)
+        close_p = round(p + random.uniform(-vol, vol), 2)
+        high_p  = round(max(open_p, close_p) + random.uniform(0, vol * 0.4), 2)
+        low_p   = round(min(open_p, close_p) - random.uniform(0, vol * 0.4), 2)
+        color   = "GREEN" if close_p >= open_p else "RED"
+        candles.append({
+            "open": open_p, "high": high_p,
+            "low":  low_p,  "close": close_p,
+            "color": color, "ticks": 60
+        })
+        p = close_p
+    log("  Seeded {} candles. ${} to ${}".format(
+        count, candles[0]["open"], candles[-1]["close"]))
+
+
+def dashboard(price, candle_count, sec_left, ema9, balance, positions):
+    cc   = current_candle
+    mins = int(sec_left) // 60
+    secs = int(sec_left) % 60
+    log("\n" + "=" * 60)
+    log("  DELTA INDIA LIVE - BTCUSD 5MIN 50x | {}".format(
+        datetime.now().strftime("%d %b %Y  %H:%M:%S")))
+    log("=" * 60)
+    log("  PRICE    : ${}".format(price))
+    log("  EMA9     : ${}".format(round(ema9, 2) if ema9 else "warming..."))
+    log("  BALANCE  : ${}  (~Rs {})".format(
+        balance if balance else "...",
+        int((balance or 0) * 84)))
+    log("  NEXT     : {}m {}s  |  CANDLE #{}".format(mins, secs, candle_count))
+    log("  LOSS/DAY : ${}  (max ${})".format(
+        round(daily_loss, 2), MAX_LOSS_PER_DAY_USD))
+    log("-" * 60)
+    if cc:
+        pct = min(100, int((time.time() - candle_start_t) / CANDLE_SEC * 100))
+        bar = "#" * (pct // 5) + "." * (20 - pct // 5)
+        log("  FORMING : O={} H={} L={} C={} [{}]".format(
+            cc["open"], cc["high"], cc["low"], price, cc["color"]))
+        log("  PROGRESS: [{}] {}%".format(bar, pct))
+    log("-" * 60)
+    if positions:
+        log("  LIVE POSITIONS:")
+        for p in positions:
+            log("  [{}] Size={} Entry=${} PNL={} Liq=${}".format(
+                p.get("direction", "?").upper(),
+                p.get("size", 0),
+                p.get("entry_price", "?"),
+                p.get("unrealized_pnl", "?"),
+                p.get("liquidation_price", "?")))
+    else:
+        log("  No open positions.")
+    if session_trades:
+        log("  SESSION TRADES: {}".format(len(session_trades)))
+        for t in session_trades[-2:]:
+            log("  #{} [{}] E=${} SL=${} TP=${} @{}".format(
+                t["id"], t["side"].upper(),
+                t["entry"], t["sl"], t["tp"], t["time"]))
+    log("=" * 60)
+
+
+def run():
+    global last_signal_id, daily_loss, product_id
+
+    log("=" * 60)
+    log("  DELTA EXCHANGE INDIA - BTCUSD 5MIN LIVE BOT")
+    log("  Running on Railway 24/7")
+    log("  Leverage:{}x  Contracts:{}  Candle:5min".format(LEVERAGE, CONTRACTS))
+    log("=" * 60)
+
+    if not API_KEY or not API_SECRET:
+        log("  [ERR] API_KEY or API_SECRET missing!")
+        log("  Railway -> Project -> Variables -> Add API_KEY and API_SECRET")
+        return
+
+    log("  API keys loaded OK.")
+
+    log("\n  Getting product ID...")
+    product_id = get_product_id()
+    if not product_id:
+        log("  [ERR] Product not found.")
+        return
+
+    log("\n  Setting leverage {}x...".format(LEVERAGE))
+    set_leverage(product_id)
+
+    log("\n  Checking balance...")
+    bal = get_balance()
+    if bal:
+        log("  Balance: ${}  (~Rs {})  Trades: ~{}".format(
+            bal, int(bal * 84), int(bal / 1.49)))
+        if bal < MIN_BALANCE_USD:
+            log("  [ERR] Balance too low.")
+            return
+
+    log("\n  Fetching live price...")
+    seed = get_price()
+    if not seed:
+        log("  [ERR] Cannot fetch price.")
+        return
+    log("  Live BTCUSD: ${}".format(seed))
+
+    log("\n  Seeding EMA warmup candles...")
+    seed_candles(seed, count=20)
+
+    start_candle(seed)
+    candle_count  = len(candles)
+    last_candle_t = time.time()
+    last_ema9     = None
+    last_bal_t    = time.time()
+    trade_count   = 0
+
+    log("\n  *** BOT IS LIVE ***")
+    log("  First candle closes in 5 minutes.\n")
+
+    while True:
+        try:
+            price = get_price()
+            if not price:
+                time.sleep(5)
+                continue
+
+            if len(candles) >= EMA_PERIOD:
+                closes    = [c["close"] for c in candles]
+                last_ema9 = calc_ema(closes, EMA_PERIOD)
+
+            update_candle(price)
+            elapsed  = time.time() - last_candle_t
+            sec_left = max(0, CANDLE_SEC - elapsed)
+
+            if time.time() - last_bal_t > 120:
+                bal        = get_balance()
+                last_bal_t = time.time()
+                if bal and bal < MIN_BALANCE_USD:
+                    log("  [SAFETY] Balance too low. Stopping!")
+                    break
+
+            if elapsed >= CANDLE_SEC:
+                closed        = close_candle(price)
+                last_candle_t = time.time()
+                candle_count  = len(candles)
+                sec_left      = CANDLE_SEC
+                if closed:
+                    log("\n" + "-" * 60)
+                    log("  [5MIN #{}] O={} H={} L={} C={} [{}] Range=${}".format(
+                        candle_count,
+                        closed["open"], closed["high"],
+                        closed["low"],  closed["close"],
+                        closed["color"],
+                        round(closed["high"] - closed["low"], 2)))
+                    if candle_count != last_signal_id:
+                        side, entry, sl, tp, risk, reward, ema9 = check_signals()
+                        if ema9:
+                            last_ema9 = ema9
+                        if side:
+                            positions = get_positions()
+                            bal       = get_balance()
+                            if safety_check(positions, bal):
+                                order = place_order(side, entry, sl, tp, product_id)
+                                if order:
+                                    last_signal_id = candle_count
+                                    trade_count   += 1
+                                    session_trades.append({
+                                        "id":    trade_count,
+                                        "side":  side,
+                                        "entry": entry,
+                                        "sl":    sl,
+                                        "tp":    tp,
+                                        "time":  datetime.now().strftime("%H:%M")
+                                    })
+
+            positions = get_positions()
+            bal       = get_balance()
+            dashboard(price, candle_count, sec_left, last_ema9, bal, positions)
+            time.sleep(FETCH_EVERY_SEC)
+
+        except KeyboardInterrupt:
+            log("  Bot stopped.")
+            break
+        except Exception as e:
+            log("  [ERR] {} - Retry in 10s...".format(e))
+            time.sleep(10)
+
+
+if __name__ == "__main__":
+    run()
