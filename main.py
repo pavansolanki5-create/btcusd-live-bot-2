@@ -1,18 +1,21 @@
 """
-BTCUSD Live Trading Bot - 1 MIN CANDLES - CLOCK SYNCED
+BTCUSD Live Trading Bot - 1 MIN CANDLES - FINAL CLEAN VERSION
 Exchange  : Delta Exchange India
 Leverage  : 50x  |  Contracts: 1 (minimum)
 
-KEY FIX: Candles now sync to real clock time.
-Candle closes exactly at HH:MM:00 every minute
-matching Delta Exchange chart candles perfectly.
+FIXES:
+  - No balance API calls (401 error)
+  - No positions API calls in dashboard (401 error)
+  - Clock synced candles match Delta Exchange chart
+  - Only places order when signal fires
+  - Tracks open trades internally
 
 BUY  : PrevRED + CurrGREEN + Close>PrevHigh + Close>EMA9
-       SL = Green candle LOW (exact)
+       SL = Green candle LOW
        TP = Entry + (Entry - SL) x 1.5
 
 SELL : PrevGREEN + CurrRED + Close<PrevLow
-       SL = Red candle HIGH (exact)
+       SL = Red candle HIGH
        TP = Entry - (SL - Entry) x 1.5
 """
 
@@ -51,10 +54,11 @@ last_price      = None
 last_signal_id  = -1
 product_id      = None
 daily_loss      = 0.0
-session_trades  = []
+session_trades  = []   # internal trade tracking
+open_trades     = []   # internally tracked open trades
 last_trade_time = 0
 trades_today    = 0
-current_minute  = -1   # tracks which minute we are in
+current_minute  = -1
 
 
 def log(msg):
@@ -95,17 +99,6 @@ def http_pub(url, timeout=4):
         log("  [PUB ERR] {}".format(e))
         return None
 
-def http_get(path, query="", timeout=4):
-    try:
-        h   = auth_headers("GET", path, query)
-        req = urllib.request.Request(
-            BASE_URL + path + query, headers=h)
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode())
-    except Exception as e:
-        log("  [GET ERR] {}".format(e))
-        return None
-
 def http_post(path, payload, timeout=5):
     try:
         body = json.dumps(payload)
@@ -123,6 +116,7 @@ def http_post(path, payload, timeout=5):
         return None
 
 
+# PRICE — public endpoint, no auth needed
 def get_price():
     global last_price
     d = http_pub(TICKER_URL, timeout=4)
@@ -138,18 +132,6 @@ def get_price():
             last_price * (1 + random.uniform(-0.0001, 0.0001)), 2)
         return last_price
     return None
-
-
-def get_positions():
-    try:
-        d = http_get("/v2/positions",
-                     "?product_symbol={}".format(SYMBOL), timeout=4)
-        if d and d.get("result") is not None:
-            return [p for p in d.get("result", [])
-                    if float(p.get("size", 0)) != 0]
-    except Exception:
-        pass
-    return []
 
 
 def get_product_id():
@@ -216,29 +198,54 @@ def place_order(side, entry, sl, tp, pid):
     return None
 
 
-# ═══════════════════════════════════════════
-#  CLOCK SYNCED CANDLE MANAGEMENT
-#  Candles close at exact minute boundaries
-#  e.g. 20:30:00, 20:31:00, 20:32:00 etc.
-#  This matches Delta Exchange chart exactly
-# ═══════════════════════════════════════════
+# ── INTERNAL TRADE TRACKER ──────────────────
+# Since positions API returns 401,
+# we track trades internally using price
+def update_open_trades(price):
+    global open_trades, daily_loss
+    still_open = []
+    for t in open_trades:
+        if t["side"] == "buy":
+            if price >= t["tp"]:
+                pnl = round(t["tp"] - t["entry"], 2)
+                t["status"] = "TP"
+                daily_loss  = round(daily_loss - pnl, 2)
+                log("  [INTERNAL] BUY TP HIT #{} PNL=+${}".format(t["id"], pnl))
+            elif price <= t["sl"]:
+                pnl = round(t["entry"] - t["sl"], 2)
+                t["status"] = "SL"
+                daily_loss  = round(daily_loss + pnl, 2)
+                log("  [INTERNAL] BUY SL HIT #{} PNL=-${}".format(t["id"], pnl))
+            else:
+                still_open.append(t)
+        else:  # sell
+            if price <= t["tp"]:
+                pnl = round(t["entry"] - t["tp"], 2)
+                t["status"] = "TP"
+                daily_loss  = round(daily_loss - pnl, 2)
+                log("  [INTERNAL] SELL TP HIT #{} PNL=+${}".format(t["id"], pnl))
+            elif price >= t["sl"]:
+                pnl = round(t["entry"] - t["sl"], 2)
+                t["status"] = "SL"
+                daily_loss  = round(daily_loss + pnl, 2)
+                log("  [INTERNAL] SELL SL HIT #{} PNL=-${}".format(t["id"], pnl))
+            else:
+                still_open.append(t)
+    open_trades = still_open
+
+
+# ── CANDLE MANAGEMENT ───────────────────────
 def get_current_minute():
-    """Returns current minute number (0-59)"""
     return datetime.now().minute
 
 def start_candle(price):
     global current_candle
     current_candle = {
-        "open":  price,
-        "high":  price,
-        "low":   price,
-        "close": price,
-        "color": "GREEN",
-        "ticks": 1,
+        "open":   price, "high": price,
+        "low":    price, "close": price,
+        "color":  "GREEN", "ticks": 1,
         "minute": get_current_minute()
     }
-    log("  New candle started at minute :{}  O={}".format(
-        str(current_candle["minute"]).zfill(2), price))
 
 def update_candle(price):
     global current_candle
@@ -252,28 +259,16 @@ def update_candle(price):
     current_candle["ticks"] += 1
 
 def close_and_new_candle(price):
-    """
-    Close current candle and start new one.
-    Called when minute changes on the clock.
-    """
     global current_candle, candles
     if current_candle is None:
         start_candle(price)
         return None
-
-    # Finalise closed candle
     current_candle["close"] = price
     current_candle["color"] = "GREEN" if price >= current_candle["open"] else "RED"
     closed = dict(current_candle)
     candles.append(closed)
     if len(candles) > 500:
         candles.pop(0)
-
-    log("  Candle CLOSED: O={} H={} L={} C={} [{}] Ticks={}".format(
-        closed["open"], closed["high"], closed["low"],
-        closed["close"], closed["color"], closed["ticks"]))
-
-    # Start fresh candle for new minute
     start_candle(price)
     return closed
 
@@ -307,7 +302,7 @@ def sell_sl_tp(candle):
 
 def check_signals():
     if len(candles) < 3:
-        log("  [SKIP] Not enough candles yet ({}/3)".format(len(candles)))
+        log("  [SKIP] Need {} more candles".format(3 - len(candles)))
         return None, None, None, None, None, None, None
 
     prev   = candles[-3]
@@ -339,26 +334,23 @@ def check_signals():
 
     if buy_ok:
         entry, sl, tp, risk, reward = buy_sl_tp(curr)
-        log("  >>> BUY SIGNAL! E={} SL={} TP={} Risk=${}".format(
-            entry, sl, tp, risk))
+        log("  >>> BUY! E={} SL={} TP={} Risk=${}".format(entry, sl, tp, risk))
         return "buy", entry, sl, tp, risk, reward, ema9
-
     if sell_ok:
         entry, sl, tp, risk, reward = sell_sl_tp(curr)
-        log("  >>> SELL SIGNAL! E={} SL={} TP={} Risk=${}".format(
-            entry, sl, tp, risk))
+        log("  >>> SELL! E={} SL={} TP={} Risk=${}".format(entry, sl, tp, risk))
         return "sell", entry, sl, tp, risk, reward, ema9
 
     log("  [NO SIGNAL]")
     return None, None, None, None, None, None, ema9
 
 
-def safety_check(positions, risk):
-    if len(positions) >= MAX_OPEN_TRADES:
-        log("  [SAFETY] Max trades open.")
+def safety_check(risk):
+    if len(open_trades) >= MAX_OPEN_TRADES:
+        log("  [SAFETY] Max {} trades open.".format(MAX_OPEN_TRADES))
         return False
     if daily_loss >= MAX_LOSS_PER_DAY_USD:
-        log("  [SAFETY] Daily loss limit hit!")
+        log("  [SAFETY] Daily loss ${}. Limit hit!".format(daily_loss))
         return False
     if trades_today >= MAX_TRADES_PER_DAY:
         log("  [SAFETY] Max {}/day reached.".format(MAX_TRADES_PER_DAY))
@@ -369,13 +361,12 @@ def safety_check(positions, risk):
             int(MIN_COOLDOWN_SEC - since_last)))
         return False
     if risk > MAX_SL_USD:
-        log("  [SAFETY] SL ${} too wide. Skip.".format(risk))
+        log("  [SAFETY] SL ${} too wide.".format(risk))
         return False
     return True
 
 
 def seed_candles(seed_price, count=20):
-    """Seed synthetic candles for EMA warmup"""
     global candles
     p = seed_price * (1 - random.uniform(0.001, 0.003))
     for _ in range(count):
@@ -388,21 +379,14 @@ def seed_candles(seed_price, count=20):
         candles.append({
             "open": open_p, "high": high_p,
             "low":  low_p,  "close": close_p,
-            "color": color, "ticks": 12,
-            "minute": -1
+            "color": color, "ticks": 12, "minute": -1
         })
         p = close_p
     log("  Seeded {} candles. ${} to ${}".format(
         count, candles[0]["open"], candles[-1]["close"]))
 
 
-def seconds_until_next_minute():
-    """How many seconds until next minute boundary"""
-    now = datetime.now()
-    return 60 - now.second
-
-
-def dashboard(price, candle_count, ema9, positions):
+def dashboard(price, candle_count, ema9):
     cc            = current_candle
     now           = datetime.now()
     sec_left      = 60 - now.second
@@ -427,21 +411,21 @@ def dashboard(price, candle_count, ema9, positions):
         bar = "#" * (pct // 5) + "." * (20 - pct // 5)
         log("  FORMING : O={} H={} L={} C={} [{}]".format(
             cc["open"], cc["high"], cc["low"], price, cc["color"]))
-        log("  PROGRESS: [{}] {}%  Ticks={}  Min=:{}".format(
-            bar, pct, cc["ticks"],
-            str(cc.get("minute", "?")).zfill(2)))
+        log("  PROGRESS: [{}] {}%  Ticks={}".format(bar, pct, cc["ticks"]))
     log("-" * 62)
-    if positions:
-        log("  LIVE POSITIONS:")
-        for p in positions:
-            log("  [{}] Size={} Entry=${} PNL={} Liq=${}".format(
-                p.get("direction", "?").upper(),
-                p.get("size", 0),
-                p.get("entry_price", "?"),
-                p.get("unrealized_pnl", "?"),
-                p.get("liquidation_price", "?")))
+    if open_trades:
+        log("  OPEN TRADES (internal tracker):")
+        for t in open_trades:
+            unreal = round(
+                (price - t["entry"]) if t["side"] == "buy"
+                else (t["entry"] - price), 2)
+            sign = "+" if unreal >= 0 else ""
+            log("  #{} [{}] E=${} SL=${} TP=${} PNL:{}${}".format(
+                t["id"], t["side"].upper(),
+                t["entry"], t["sl"], t["tp"],
+                sign, unreal))
     else:
-        log("  No open positions.")
+        log("  No open trades.")
     if session_trades:
         log("  SESSION: {} trades".format(len(session_trades)))
         for t in session_trades[-3:]:
@@ -452,12 +436,12 @@ def dashboard(price, candle_count, ema9, positions):
 
 
 def run():
-    global last_signal_id, daily_loss, product_id
+    global last_signal_id, product_id
     global last_trade_time, trades_today, current_minute
 
     log("=" * 62)
     log("  DELTA EXCHANGE INDIA - BTCUSD 1MIN LIVE BOT")
-    log("  CLOCK SYNCED - Candles match Delta Exchange chart")
+    log("  CLOCK SYNCED + NO POSITION/BALANCE API CALLS")
     log("  Leverage:{}x  Contracts:{}".format(LEVERAGE, CONTRACTS))
     log("  MaxSL:${}  Cooldown:{}s  MaxTrades:{}/day".format(
         MAX_SL_USD, MIN_COOLDOWN_SEC, MAX_TRADES_PER_DAY))
@@ -485,28 +469,23 @@ def run():
         return
     log("  Live BTCUSD: ${}".format(seed))
 
-    log("\n  Seeding {} EMA warmup candles...".format(20))
+    log("\n  Seeding EMA warmup candles...")
     seed_candles(seed, count=20)
 
-    # Start first candle aligned to current minute
     current_minute = get_current_minute()
     start_candle(seed)
     candle_count = len(candles)
     last_ema9    = None
     trade_count  = 0
 
-    # Tell user when first real candle closes
-    sec_left = seconds_until_next_minute()
-    log("\n  *** BOT IS LIVE - CLOCK SYNCED ***")
-    log("  Candles close at exact minute boundaries")
-    log("  Next candle close in {} seconds  (at :{})".format(
-        sec_left,
-        str((datetime.now().minute + 1) % 60).zfill(2)))
-    log("  Price check every {} seconds\n".format(FETCH_EVERY_SEC))
+    sec_left = 60 - datetime.now().second
+    log("\n  *** BOT IS LIVE ***")
+    log("  Clock synced - no 401 errors")
+    log("  Next candle close in {}s".format(sec_left))
+    log("  Price check every {}s\n".format(FETCH_EVERY_SEC))
 
     while True:
         try:
-            # Fetch live price
             price = get_price()
             if not price:
                 time.sleep(5)
@@ -520,45 +499,43 @@ def run():
             # Update forming candle
             update_candle(price)
 
-            # ── CLOCK SYNC: Check if minute has changed ──
+            # Update internal trade tracker
+            update_open_trades(price)
+
+            # Check minute boundary
             this_minute = get_current_minute()
 
             if this_minute != current_minute:
-                # Minute boundary crossed — close candle!
                 log("\n" + "=" * 62)
-                log("  MINUTE BOUNDARY: :{} → :{}  CLOSING CANDLE".format(
+                log("  CANDLE CLOSE :{} → :{}".format(
                     str(current_minute).zfill(2),
                     str(this_minute).zfill(2)))
 
-                closed        = close_and_new_candle(price)
+                closed         = close_and_new_candle(price)
                 current_minute = this_minute
                 candle_count   = len(candles)
 
                 if closed:
-                    log("  [1MIN CANDLE #{}] O={} H={} L={} C={} [{}]".format(
+                    log("  [1MIN #{}] O={} H={} L={} C={} [{}] Range=${}".format(
                         candle_count,
                         closed["open"], closed["high"],
                         closed["low"],  closed["close"],
-                        closed["color"]))
-                    log("  Range: ${}".format(
+                        closed["color"],
                         round(closed["high"] - closed["low"], 2)))
 
-                    # Check signal on closed candle
                     if candle_count != last_signal_id:
                         side, entry, sl, tp, risk, reward, ema9 = check_signals()
                         if ema9:
                             last_ema9 = ema9
 
                         if side:
-                            positions = get_positions()
-
-                            if safety_check(positions, risk):
+                            if safety_check(risk):
                                 log("\n  " + "*" * 48)
-                                log("  *** {} SIGNAL - TRADE #{} ***".format(
+                                log("  *** {} TRADE #{} ***".format(
                                     side.upper(), trade_count + 1))
                                 log("  Entry  : ${}".format(entry))
-                                log("  SL     : ${}  Risk -${}".format(sl, risk))
-                                log("  TP     : ${}  Reward +${}".format(tp, reward))
+                                log("  SL     : ${}  Risk  -${}".format(sl, risk))
+                                log("  TP     : ${}  Reward+${}".format(tp, reward))
                                 log("  R:R    : 1:1.5")
                                 log("  " + "*" * 48)
 
@@ -570,24 +547,24 @@ def run():
                                     trade_count    += 1
                                     trades_today   += 1
                                     last_trade_time = time.time()
-                                    session_trades.append({
+                                    new_trade = {
                                         "id":    trade_count,
                                         "side":  side,
                                         "entry": entry,
                                         "sl":    sl,
                                         "tp":    tp,
                                         "time":  datetime.now().strftime("%H:%M")
-                                    })
-                                    log("  *** ORDER IS LIVE ON EXCHANGE! ***")
+                                    }
+                                    session_trades.append(new_trade)
+                                    open_trades.append(new_trade)
+                                    log("  *** ORDER IS LIVE! ***")
 
-            # Dashboard
-            positions = get_positions()
-            dashboard(price, candle_count, last_ema9, positions)
+            dashboard(price, candle_count, last_ema9)
             time.sleep(FETCH_EVERY_SEC)
 
         except KeyboardInterrupt:
             log("  Bot stopped.")
-            log("  Trades today: {}".format(trades_today))
+            log("  Trades: {}  Loss: ${}".format(trades_today, daily_loss))
             break
         except Exception as e:
             log("  [ERR] {} - Retry in 5s...".format(e))
