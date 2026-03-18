@@ -3,15 +3,17 @@ BTCUSD Live Trading Bot - 1 MIN CANDLES
 Exchange  : Delta Exchange India
 Leverage  : 50x  |  Contracts: 1 (minimum)
 
-FIXES IN THIS VERSION:
-  1. Reduced seed candles to 9 (just enough for EMA9)
-     So real candles take over EMA calculation faster
-  2. Full condition debug on every candle close
-  3. Safety check reasons printed clearly
-  4. Correct candle index (curr=last closed, prev=before that)
+FIX: MAX_SL_USD increased from $80 to $200
+     BTCUSD 1min candles typically range $30-$150
+     $80 was blocking most valid signals
 
 BUY  : PREV RED + CURR GREEN + CURR close > PREV high + CURR close > EMA9
+       SL = Green candle LOW
+       TP = Entry + (Entry - SL) x 1.5
+
 SELL : PREV GREEN + CURR RED + CURR close < PREV low
+       SL = Red candle HIGH
+       TP = Entry - (SL - Entry) x 1.5
 """
 
 import time
@@ -36,7 +38,7 @@ FETCH_EVERY_SEC = 5
 MAX_OPEN_TRADES      = 2
 MAX_TRADES_PER_DAY   = 10
 MAX_LOSS_PER_DAY_USD = 2.0
-MAX_SL_USD           = 80.0
+MAX_SL_USD           = 200.0   # increased from $80 to $200
 MIN_COOLDOWN_SEC     = 60
 
 BASE_URL     = "https://api.india.delta.exchange"
@@ -285,54 +287,44 @@ def sell_sl_tp(candle):
 
 
 def check_signals():
-    """
-    candles list (only closed candles):
-      candles[-1] = CURR = most recently closed candle
-      candles[-2] = PREV = candle before CURR
-    current_candle = still forming, NOT in this list
-    """
     if len(candles) < 2:
         log("  [SKIP] Need 2 closed candles, have {}".format(len(candles)))
         return None, None, None, None, None, None, None
 
-    curr = candles[-1]   # most recently closed
-    prev = candles[-2]   # one before that
+    curr = candles[-1]
+    prev = candles[-2]
 
     closes = [c["close"] for c in candles]
     ema9   = calc_ema(closes, EMA_PERIOD)
 
-    # Individual condition values
-    c1_buy  = prev["close"] < prev["open"]        # prev RED
-    c2_buy  = curr["close"] > curr["open"]        # curr GREEN
-    c3_buy  = curr["close"] > prev["high"]        # engulf up
-    c4_buy  = ema9 is not None and curr["close"] > ema9  # above EMA9
+    c1_buy  = prev["close"] < prev["open"]
+    c2_buy  = curr["close"] > curr["open"]
+    c3_buy  = curr["close"] > prev["high"]
+    c4_buy  = ema9 is not None and curr["close"] > ema9
 
-    c1_sell = prev["close"] > prev["open"]        # prev GREEN
-    c2_sell = curr["close"] < curr["open"]        # curr RED
-    c3_sell = curr["close"] < prev["low"]         # engulf down
+    c1_sell = prev["close"] > prev["open"]
+    c2_sell = curr["close"] < curr["open"]
+    c3_sell = curr["close"] < prev["low"]
 
     buy_ok  = c1_buy  and c2_buy  and c3_buy  and c4_buy
     sell_ok = c1_sell and c2_sell and c3_sell
 
-    # Full debug log
-    log("  ── SIGNAL CHECK ──────────────────────────")
     log("  PREV: O={} H={} L={} C={} [{}]".format(
         prev["open"], prev["high"], prev["low"], prev["close"], prev["color"]))
     log("  CURR: O={} H={} L={} C={} [{}]".format(
         curr["open"], curr["high"], curr["low"], curr["close"], curr["color"]))
     log("  EMA9: {}".format(round(ema9, 2) if ema9 else "not ready"))
-    log("  BUY  [{}] PrevRED:{} CurrGREEN:{} Close{}>{}: {} Close{}>{}: {}".format(
+    log("  BUY  [{}] PrevRED:{} CurrGREEN:{} Engulf:{} AboveEMA:{}".format(
         "PASS" if buy_ok else "FAIL",
         "Y" if c1_buy else "N",
         "Y" if c2_buy else "N",
-        curr["close"], prev["high"], "Y" if c3_buy else "N",
-        curr["close"], round(ema9, 2) if ema9 else "?",
-        "Y" if c4_buy else "N"))
-    log("  SELL [{}] PrevGREEN:{} CurrRED:{} Close{}<{}: {}".format(
+        "Y({}>{})" .format(curr["close"], prev["high"]) if c3_buy  else "N({}<{})".format(curr["close"], prev["high"]),
+        "Y({}>{})" .format(curr["close"], round(ema9,2) if ema9 else "?") if c4_buy else "N"))
+    log("  SELL [{}] PrevGREEN:{} CurrRED:{} Engulf:{}".format(
         "PASS" if sell_ok else "FAIL",
         "Y" if c1_sell else "N",
         "Y" if c2_sell else "N",
-        curr["close"], prev["low"], "Y" if c3_sell else "N"))
+        "Y({}<{})".format(curr["close"], prev["low"]) if c3_sell else "N({}>={})".format(curr["close"], prev["low"])))
 
     if buy_ok:
         entry, sl, tp, risk, reward = buy_sl_tp(curr)
@@ -349,31 +341,27 @@ def check_signals():
 
 def safety_check(risk):
     if len(open_trades) >= MAX_OPEN_TRADES:
-        log("  [SAFETY BLOCK] Max {} trades open.".format(MAX_OPEN_TRADES))
+        log("  [BLOCK] Max {} trades open.".format(MAX_OPEN_TRADES))
         return False
     if daily_loss >= MAX_LOSS_PER_DAY_USD:
-        log("  [SAFETY BLOCK] Daily loss ${} limit.".format(daily_loss))
+        log("  [BLOCK] Daily loss ${}.".format(daily_loss))
         return False
     if trades_today >= MAX_TRADES_PER_DAY:
-        log("  [SAFETY BLOCK] Max {}/day.".format(MAX_TRADES_PER_DAY))
+        log("  [BLOCK] Max {}/day.".format(MAX_TRADES_PER_DAY))
         return False
     since_last = time.time() - last_trade_time
     if since_last < MIN_COOLDOWN_SEC:
-        log("  [SAFETY BLOCK] Cooldown {}s left.".format(
+        log("  [BLOCK] Cooldown {}s left.".format(
             int(MIN_COOLDOWN_SEC - since_last)))
         return False
     if risk > MAX_SL_USD:
-        log("  [SAFETY BLOCK] SL ${} > max ${}. Skipping.".format(
-            risk, MAX_SL_USD))
+        log("  [BLOCK] SL ${} > max ${}. Skip.".format(risk, MAX_SL_USD))
         return False
+    log("  [OK] All safety checks passed. Placing order...")
     return True
 
 
 def seed_candles(seed_price, count=9):
-    """
-    Only seed EMA_PERIOD candles (9).
-    Real candles will replace synthetic ones faster.
-    """
     global candles
     p = seed_price
     for _ in range(count):
@@ -389,7 +377,7 @@ def seed_candles(seed_price, count=9):
             "color": color, "ticks": 12, "minute": -1
         })
         p = close_p
-    log("  Seeded {} candles near live price ${}".format(count, seed_price))
+    log("  Seeded {} candles near ${}".format(count, seed_price))
 
 
 def dashboard(price, candle_count, ema9):
@@ -419,14 +407,12 @@ def dashboard(price, candle_count, ema9):
             cc["open"], cc["high"], cc["low"], price, cc["color"]))
         log("  PROGRESS: [{}] {}%  Ticks={}".format(bar, pct, cc["ticks"]))
     if len(candles) >= 2:
-        log("  CURR(last closed): O={} H={} L={} C={} [{}]".format(
+        log("  CURR: O={} H={} L={} C={} [{}]".format(
             candles[-1]["open"], candles[-1]["high"],
-            candles[-1]["low"],  candles[-1]["close"],
-            candles[-1]["color"]))
-        log("  PREV(before curr): O={} H={} L={} C={} [{}]".format(
+            candles[-1]["low"],  candles[-1]["close"], candles[-1]["color"]))
+        log("  PREV: O={} H={} L={} C={} [{}]".format(
             candles[-2]["open"], candles[-2]["high"],
-            candles[-2]["low"],  candles[-2]["close"],
-            candles[-2]["color"]))
+            candles[-2]["low"],  candles[-2]["close"], candles[-2]["color"]))
     log("-" * 62)
     if open_trades:
         log("  OPEN TRADES:")
@@ -441,7 +427,7 @@ def dashboard(price, candle_count, ema9):
     else:
         log("  No open trades.")
     if session_trades:
-        log("  SESSION: {}".format(len(session_trades)))
+        log("  SESSION: {} trades".format(len(session_trades)))
         for t in session_trades[-3:]:
             log("  #{} [{}] E=${} SL=${} TP=${} @{}".format(
                 t["id"], t["side"].upper(),
@@ -455,8 +441,9 @@ def run():
 
     log("=" * 62)
     log("  DELTA EXCHANGE INDIA - BTCUSD 1MIN LIVE BOT")
-    log("  Leverage:{}x  MaxSL:${}  Cooldown:{}s".format(
+    log("  Leverage:{}x  MAX SL:${}  Cooldown:{}s".format(
         LEVERAGE, MAX_SL_USD, MIN_COOLDOWN_SEC))
+    log("  (MAX SL increased to ${} for BTCUSD 1min)".format(MAX_SL_USD))
     log("=" * 62)
 
     if not API_KEY or not API_SECRET:
@@ -481,8 +468,7 @@ def run():
         return
     log("  Live BTCUSD: ${}".format(seed))
 
-    # Seed only 9 candles (minimum for EMA9) near live price
-    log("\n  Seeding minimal candles near live price...")
+    log("\n  Seeding minimal EMA warmup candles...")
     seed_candles(seed, count=9)
 
     current_minute = get_current_minute()
@@ -494,7 +480,7 @@ def run():
     sec_left = 60 - datetime.now().second
     log("\n  *** BOT IS LIVE ***")
     log("  Next candle close in {}s".format(sec_left))
-    log("  Full signal debug on every candle close\n")
+    log("  Signal check + full debug on every candle close\n")
 
     while True:
         try:
@@ -523,7 +509,7 @@ def run():
                 candle_count   = len(candles)
 
                 if closed:
-                    log("  CLOSED #{}  O={} H={} L={} C={} [{}] Range=${}".format(
+                    log("  #{}  O={} H={} L={} C={} [{}] Range=${}".format(
                         candle_count,
                         closed["open"], closed["high"],
                         closed["low"],  closed["close"],
