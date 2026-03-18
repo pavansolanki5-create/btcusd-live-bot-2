@@ -1,7 +1,11 @@
 """
-BTCUSD Live Trading Bot - 1 MIN CANDLES
+BTCUSD Live Trading Bot - 1 MIN CANDLES - FREEZE FIX
 Exchange  : Delta Exchange India
 Leverage  : 50x  |  Contracts: 1 (minimum)
+
+FIX: Removed balance API calls from main loop.
+     Balance was freezing the bot every 2 minutes.
+     Monitor balance manually on Delta Exchange app.
 
 BUY  : PrevRED + CurrGREEN + Close>PrevHigh + Close>EMA9
        SL = Green candle LOW (exact)
@@ -34,7 +38,6 @@ CANDLE_SEC      = 60
 
 MAX_OPEN_TRADES      = 2
 MAX_TRADES_PER_DAY   = 10
-MIN_BALANCE_USD      = 1.50
 MAX_LOSS_PER_DAY_USD = 2.0
 MAX_SL_USD           = 80.0
 MIN_COOLDOWN_SEC     = 60
@@ -81,7 +84,7 @@ def auth_headers(method, path, query="", body=""):
         "User-Agent":   "Mozilla/5.0"
     }
 
-def http_pub(url, timeout=6):
+def http_pub(url, timeout=4):
     try:
         req = urllib.request.Request(
             url,
@@ -93,18 +96,18 @@ def http_pub(url, timeout=6):
         log("  [PUB ERR] {}".format(e))
         return None
 
-def http_get(path, query=""):
+def http_get(path, query="", timeout=4):
     try:
         h   = auth_headers("GET", path, query)
         req = urllib.request.Request(
             BASE_URL + path + query, headers=h)
-        with urllib.request.urlopen(req, timeout=8) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode())
     except Exception as e:
         log("  [GET ERR] {}".format(e))
         return None
 
-def http_post(path, payload):
+def http_post(path, payload, timeout=4):
     try:
         body = json.dumps(payload)
         h    = auth_headers("POST", path, "", body)
@@ -114,16 +117,17 @@ def http_post(path, payload):
             headers=h,
             method="POST"
         )
-        with urllib.request.urlopen(req, timeout=8) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode())
     except Exception as e:
         log("  [POST ERR] {}".format(e))
         return None
 
 
+# LIVE MARK PRICE — fast timeout 4s
 def get_price():
     global last_price
-    d = http_pub(TICKER_URL)
+    d = http_pub(TICKER_URL, timeout=4)
     if d:
         r = d.get("result", {})
         p = (r.get("mark_price") or r.get("close") or
@@ -131,6 +135,7 @@ def get_price():
         if p:
             last_price = round(float(p), 2)
             return last_price
+    # fallback nudge if API fails
     if last_price:
         last_price = round(
             last_price * (1 + random.uniform(-0.0002, 0.0002)), 2)
@@ -138,76 +143,27 @@ def get_price():
     return None
 
 
-def get_balance():
-    """
-    Delta Exchange India balance API.
-    Only 2 permissions exist: Read Data and Trading.
-    Balance endpoint requires Trading permission.
-    Tries multiple methods to get balance.
-    """
+# POSITIONS — fast timeout 4s
+def get_positions():
     try:
-        # Method 1: wallet/balances (requires Trading permission)
-        d = http_get("/v2/wallet/balances")
-        if d and d.get("success"):
-            result = d.get("result", [])
-            if isinstance(result, list):
-                for a in result:
-                    sym = str(a.get("asset_symbol", "")).upper()
-                    if sym in ["USDT", "USD"]:
-                        for field in ["available_balance", "balance",
-                                      "available_balance_for_orders"]:
-                            val = a.get(field)
-                            if val is not None:
-                                try:
-                                    b = float(val)
-                                    if b >= 0:
-                                        return round(b, 4)
-                                except Exception:
-                                    pass
-                # any non-zero balance
-                for a in result:
-                    for field in ["available_balance", "balance"]:
-                        val = a.get(field)
-                        if val is not None:
-                            try:
-                                b = float(val)
-                                if b > 0:
-                                    return round(b, 4)
-                            except Exception:
-                                pass
-            if isinstance(result, dict):
-                for field in ["available_balance", "balance"]:
-                    val = result.get(field)
-                    if val is not None:
-                        try:
-                            b = float(val)
-                            if b >= 0:
-                                return round(b, 4)
-                        except Exception:
-                            pass
-
-        # Method 2: orders used margin as balance proxy
-        d = http_get("/v2/orders", "?state=open&product_symbol=BTCUSD")
-        if d and d.get("success"):
-            # API works, just balance not accessible
-            # Return None — bot continues without balance display
-            pass
-
-        return None
-
-    except Exception as e:
-        log("  [BAL ERR] {}".format(e))
-        return None
+        d = http_get("/v2/positions",
+                     "?product_symbol={}".format(SYMBOL), timeout=4)
+        if d and d.get("result"):
+            return [p for p in d.get("result", [])
+                    if float(p.get("size", 0)) != 0]
+    except Exception:
+        pass
+    return []
 
 
 def get_product_id():
-    d = http_pub(PRODUCTS_URL)
+    d = http_pub(PRODUCTS_URL, timeout=6)
     if d:
         pid = d.get("result", {}).get("id")
         if pid:
             log("  Product ID: {}".format(pid))
             return pid
-    d = http_pub("{}/v2/products".format(BASE_URL))
+    d = http_pub("{}/v2/products".format(BASE_URL), timeout=6)
     if d:
         for p in d.get("result", []):
             if p.get("symbol") == SYMBOL:
@@ -220,21 +176,12 @@ def set_leverage(pid):
     d = http_post("/v2/products/leverage", {
         "product_id": pid,
         "leverage":   str(LEVERAGE)
-    })
+    }, timeout=6)
     if d and d.get("success"):
         log("  Leverage set to {}x".format(LEVERAGE))
         return True
     log("  [WARN] Leverage set failed: {}".format(d))
     return False
-
-
-def get_positions():
-    d = http_get("/v2/positions",
-                 "?product_symbol={}".format(SYMBOL))
-    if d:
-        return [p for p in d.get("result", [])
-                if float(p.get("size", 0)) != 0]
-    return []
 
 
 def place_order(side, entry, sl, tp, pid):
@@ -261,7 +208,7 @@ def place_order(side, entry, sl, tp, pid):
     }
     log("  Placing {} bracket: E={} SL={} TP={}".format(
         side.upper(), lp, sl, tp))
-    d = http_post("/v2/orders", payload)
+    d = http_post("/v2/orders", payload, timeout=6)
     if d:
         if d.get("success"):
             o = d.get("result", {})
@@ -368,23 +315,22 @@ def check_signals():
 
     if buy_ok:
         entry, sl, tp, risk, reward = buy_sl_tp(curr)
-        log("  >>> BUY! E={} SL={} TP={} Risk=${}".format(entry, sl, tp, risk))
+        log("  >>> BUY! E={} SL={} TP={} Risk=${}".format(
+            entry, sl, tp, risk))
         return "buy", entry, sl, tp, risk, reward, ema9
     if sell_ok:
         entry, sl, tp, risk, reward = sell_sl_tp(curr)
-        log("  >>> SELL! E={} SL={} TP={} Risk=${}".format(entry, sl, tp, risk))
+        log("  >>> SELL! E={} SL={} TP={} Risk=${}".format(
+            entry, sl, tp, risk))
         return "sell", entry, sl, tp, risk, reward, ema9
 
     log("  [NO SIGNAL]")
     return None, None, None, None, None, None, ema9
 
 
-def safety_check(positions, balance, risk):
+def safety_check(positions, risk):
     if len(positions) >= MAX_OPEN_TRADES:
         log("  [SAFETY] Max trades open.")
-        return False
-    if balance is not None and balance < MIN_BALANCE_USD:
-        log("  [SAFETY] Balance too low!")
         return False
     if daily_loss >= MAX_LOSS_PER_DAY_USD:
         log("  [SAFETY] Daily loss limit hit!")
@@ -423,7 +369,7 @@ def seed_candles(seed_price, count=20):
         count, candles[0]["open"], candles[-1]["close"]))
 
 
-def dashboard(price, candle_count, sec_left, ema9, balance, positions):
+def dashboard(price, candle_count, sec_left, ema9, positions):
     cc            = current_candle
     cooldown_left = max(0, int(MIN_COOLDOWN_SEC - (time.time() - last_trade_time)))
     log("\n" + "=" * 62)
@@ -432,9 +378,7 @@ def dashboard(price, candle_count, sec_left, ema9, balance, positions):
     log("=" * 62)
     log("  PRICE    : ${}".format(price))
     log("  EMA9     : ${}".format(round(ema9, 2) if ema9 else "warming..."))
-    log("  BALANCE  : {}  (~Rs {})".format(
-        "${}".format(balance) if balance is not None else "Check Delta app",
-        int((balance or 0) * 84)))
+    log("  BALANCE  : Check Delta app manually")
     log("  NEXT     : {}s  |  CANDLE #{}".format(int(sec_left), candle_count))
     log("  TODAY    : {} trades (max {})  LOSS: ${} (max ${})".format(
         trades_today, MAX_TRADES_PER_DAY,
@@ -478,6 +422,7 @@ def run():
     log("  Leverage:{}x  Contracts:{}  Candle:1min".format(LEVERAGE, CONTRACTS))
     log("  MaxTrades:{}/day  MaxSL:${}  Cooldown:{}s".format(
         MAX_TRADES_PER_DAY, MAX_SL_USD, MIN_COOLDOWN_SEC))
+    log("  Balance API removed - check Delta app manually")
     log("=" * 62)
 
     if not API_KEY or not API_SECRET:
@@ -495,15 +440,6 @@ def run():
     log("\n  Setting leverage {}x...".format(LEVERAGE))
     set_leverage(product_id)
 
-    log("\n  Checking balance (may show N/A - normal for Delta API)...")
-    bal = get_balance()
-    if bal is not None:
-        log("  Balance: ${}  (~Rs {})".format(bal, int(bal * 84)))
-    else:
-        log("  Balance: Not accessible via API.")
-        log("  Monitor balance manually on Delta Exchange app.")
-        log("  Bot will still trade normally.")
-
     log("\n  Fetching live price...")
     seed = get_price()
     if not seed:
@@ -518,32 +454,32 @@ def run():
     candle_count  = len(candles)
     last_candle_t = time.time()
     last_ema9     = None
-    last_bal_t    = time.time()
     trade_count   = 0
 
     log("\n  *** BOT IS LIVE ***")
     log("  1 min candle | Price check every {}s".format(FETCH_EVERY_SEC))
+    log("  No balance API calls - bot will NOT freeze")
     log("  First candle closes in 1 minute.\n")
 
     while True:
         try:
+            # Fetch price — fast 4s timeout
             price = get_price()
             if not price:
                 time.sleep(5)
                 continue
 
+            # Update EMA
             if len(candles) >= EMA_PERIOD:
                 closes    = [c["close"] for c in candles]
                 last_ema9 = calc_ema(closes, EMA_PERIOD)
 
+            # Update forming candle
             update_candle(price)
             elapsed  = time.time() - last_candle_t
             sec_left = max(0, CANDLE_SEC - elapsed)
 
-            if time.time() - last_bal_t > 120:
-                bal        = get_balance()
-                last_bal_t = time.time()
-
+            # Close candle every 60 seconds
             if elapsed >= CANDLE_SEC:
                 closed        = close_candle(price)
                 last_candle_t = time.time()
@@ -565,10 +501,10 @@ def run():
                             last_ema9 = ema9
 
                         if side:
+                            # get_positions has fast 4s timeout - won't freeze
                             positions = get_positions()
-                            bal       = get_balance()
 
-                            if safety_check(positions, bal, risk):
+                            if safety_check(positions, risk):
                                 log("  *** {} TRADE #{} ***".format(
                                     side.upper(), trade_count + 1))
                                 log("  E={} SL={} TP={} Risk=${} Reward=${}".format(
@@ -592,9 +528,9 @@ def run():
                                     })
                                     log("  ORDER IS LIVE!")
 
+            # Dashboard — no balance call here
             positions = get_positions()
-            bal       = get_balance()
-            dashboard(price, candle_count, sec_left, last_ema9, bal, positions)
+            dashboard(price, candle_count, sec_left, last_ema9, positions)
             time.sleep(FETCH_EVERY_SEC)
 
         except KeyboardInterrupt:
