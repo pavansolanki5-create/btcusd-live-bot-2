@@ -230,4 +230,5 @@ else:
 log("\n" + "=" * 60)
 log("  TEST COMPLETE")
 log("  Share the output above and we will fix any issues.")
+time.sleep(30)  # keeps container alive so you can read logs
 log("=" * 60)
