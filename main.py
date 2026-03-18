@@ -1,14 +1,8 @@
 """
 ORDER PLACEMENT TEST SCRIPT
 Delta Exchange India - BTCUSD
-
-This script:
-1. Fetches live BTCUSD mark price
-2. Places ONE real BUY limit order with SL and TP
-3. Shows full API response
-4. Cancels the order immediately after
-
-Run this to verify API keys work for trading.
+Place this as main.py on GitHub
+Railway will run it and show results in logs
 """
 
 import time
@@ -19,7 +13,6 @@ import os
 import urllib.request
 from datetime import datetime
 
-# ── API KEYS ────────────────────────────────
 API_KEY    = os.environ.get("API_KEY",    "")
 API_SECRET = os.environ.get("API_SECRET", "")
 BASE_URL   = "https://api.india.delta.exchange"
@@ -60,18 +53,7 @@ def http_pub(url):
         with urllib.request.urlopen(req, timeout=6) as r:
             return json.loads(r.read().decode())
     except Exception as e:
-        log("  [ERR] {}".format(e))
-        return None
-
-def http_get(path, query=""):
-    try:
-        h   = auth_headers("GET", path, query)
-        req = urllib.request.Request(
-            BASE_URL + path + query, headers=h)
-        with urllib.request.urlopen(req, timeout=6) as r:
-            return json.loads(r.read().decode())
-    except Exception as e:
-        log("  [ERR] {}".format(e))
+        log("ERR: {}".format(e))
         return None
 
 def http_post(path, payload):
@@ -87,7 +69,7 @@ def http_post(path, payload):
         with urllib.request.urlopen(req, timeout=6) as r:
             return json.loads(r.read().decode())
     except Exception as e:
-        log("  [ERR] {}".format(e))
+        log("ERR: {}".format(e))
         return None
 
 def http_delete(path, payload):
@@ -103,43 +85,54 @@ def http_delete(path, payload):
         with urllib.request.urlopen(req, timeout=6) as r:
             return json.loads(r.read().decode())
     except Exception as e:
-        log("  [ERR] {}".format(e))
+        log("ERR: {}".format(e))
         return None
 
 
 log("=" * 60)
 log("  DELTA EXCHANGE INDIA - ORDER TEST")
+log("  " + datetime.now().strftime("%d %b %Y  %H:%M:%S"))
 log("=" * 60)
 
-# ── STEP 1: Validate keys ───────────────────
+# STEP 1: Check API Keys
+log("\n--- STEP 1: Check API Keys ---")
 if not API_KEY or not API_SECRET:
-    log("  [ERR] API_KEY or API_SECRET not set!")
-    log("  Set them in Railway Variables tab.")
+    log("FAIL: API_KEY or API_SECRET not set!")
+    log("Railway -> Variables -> Add API_KEY and API_SECRET")
+    for i in range(18):
+        time.sleep(5)
+        log("Closing in {}s...".format(90 - (i+1)*5))
     exit()
-log("  API Key: {}...{}".format(API_KEY[:4], API_KEY[-4:]))
+log("Key: {}...{}".format(API_KEY[:4], API_KEY[-4:]))
+log("PASS")
 
-# ── STEP 2: Get live price ──────────────────
-log("\n  STEP 1: Fetching live BTCUSD mark price...")
+# STEP 2: Fetch Price
+log("\n--- STEP 2: Fetch Live Price ---")
 d = http_pub("{}/v2/tickers/BTCUSD".format(BASE_URL))
 if not d:
-    log("  [ERR] Cannot fetch price!")
+    log("FAIL: No response from ticker API")
+    for i in range(18):
+        time.sleep(5)
+        log("Closing in {}s...".format(90 - (i+1)*5))
     exit()
-
-result = d.get("result", {})
-price  = float(result.get("mark_price") or result.get("close") or 0)
+r     = d.get("result", {})
+price = float(r.get("mark_price") or r.get("close") or r.get("last_price") or 0)
 if not price:
-    log("  [ERR] No price in response: {}".format(result))
+    log("FAIL: No price. Response: {}".format(d))
+    for i in range(18):
+        time.sleep(5)
+        log("Closing in {}s...".format(90 - (i+1)*5))
     exit()
-log("  Live BTCUSD: ${}".format(price))
+log("Live BTCUSD: ${}".format(price))
+log("PASS")
 
-# ── STEP 3: Get product ID ──────────────────
-log("\n  STEP 2: Getting BTCUSD product ID...")
-d = http_pub("{}/v2/products/BTCUSD".format(BASE_URL))
+# STEP 3: Get Product ID
+log("\n--- STEP 3: Get Product ID ---")
 pid = None
+d   = http_pub("{}/v2/products/BTCUSD".format(BASE_URL))
 if d:
     pid = d.get("result", {}).get("id")
 if not pid:
-    # search all products
     d = http_pub("{}/v2/products".format(BASE_URL))
     if d:
         for p in d.get("result", []):
@@ -147,37 +140,39 @@ if not pid:
                 pid = p["id"]
                 break
 if not pid:
-    log("  [ERR] Cannot find product ID!")
+    log("FAIL: Product ID not found!")
+    for i in range(18):
+        time.sleep(5)
+        log("Closing in {}s...".format(90 - (i+1)*5))
     exit()
-log("  Product ID: {}".format(pid))
+log("Product ID: {}".format(pid))
+log("PASS")
 
-# ── STEP 4: Set leverage ────────────────────
-log("\n  STEP 3: Setting leverage to 50x...")
+# STEP 4: Set Leverage
+log("\n--- STEP 4: Set Leverage 50x ---")
 d = http_post("/v2/products/leverage", {
     "product_id": pid,
     "leverage":   "50"
 })
 if d and d.get("success"):
-    log("  Leverage set to 50x OK")
+    log("Leverage 50x set. PASS")
 else:
-    log("  [WARN] Leverage response: {}".format(d))
+    log("WARN: {}".format(d))
 
-# ── STEP 5: Calculate test order levels ─────
-log("\n  STEP 4: Calculating test order levels...")
+# STEP 5: Calculate Safe Test Order
+log("\n--- STEP 5: Calculate Levels ---")
+entry  = round(price * 0.995, 1)
+sl     = round(entry - 50,    1)
+tp     = round(entry + 75,    1)
+sl_lim = round(sl - 1,        1)
+tp_lim = round(tp - 1,        1)
+log("Market : ${}".format(price))
+log("Entry  : ${} (0.5% below market, will NOT fill)".format(entry))
+log("SL     : ${}".format(sl))
+log("TP     : ${}".format(tp))
 
-# Place a BUY limit order BELOW current price
-# so it won't fill immediately (safe test)
-entry = round(price * 0.995, 1)    # 0.5% below current price
-sl    = round(entry - 50, 1)       # $50 below entry
-tp    = round(entry + 75, 1)       # $75 above entry (1:1.5)
-
-log("  Current price : ${}".format(price))
-log("  Test entry    : ${} (0.5% below market - won't fill)".format(entry))
-log("  Test SL       : ${}".format(sl))
-log("  Test TP       : ${}".format(tp))
-
-# ── STEP 6: Place bracket order ─────────────
-log("\n  STEP 5: Placing test bracket order...")
+# STEP 6: Place Order
+log("\n--- STEP 6: Place Bracket Order ---")
 payload = {
     "product_id":                      pid,
     "size":                            1,
@@ -185,50 +180,60 @@ payload = {
     "order_type":                      "limit_order",
     "limit_price":                     str(entry),
     "bracket_stop_loss_price":         str(sl),
-    "bracket_stop_loss_limit_price":   str(round(sl - 1, 1)),
+    "bracket_stop_loss_limit_price":   str(sl_lim),
     "bracket_take_profit_price":       str(tp),
-    "bracket_take_profit_limit_price": str(round(tp - 1, 1)),
+    "bracket_take_profit_limit_price": str(tp_lim),
     "time_in_force":                   "gtc"
 }
-
-log("  Payload: {}".format(json.dumps(payload, indent=2)))
-
+log("Placing order...")
 d = http_post("/v2/orders", payload)
-log("\n  Full API Response:")
-log(json.dumps(d, indent=2))
+log("Full response:")
+log(json.dumps(d, indent=2) if d else "None")
 
-if not d:
-    log("\n  [RESULT] No response from API!")
-elif d.get("success"):
+order_id = None
+if d and d.get("success"):
     order_id = d.get("result", {}).get("id")
     state    = d.get("result", {}).get("state")
-    log("\n  [SUCCESS] Order placed!")
-    log("  Order ID : {}".format(order_id))
-    log("  State    : {}".format(state))
+    log("\nSUCCESS - Order placed!")
+    log("Order ID : {}".format(order_id))
+    log("State    : {}".format(state))
+    log("PASS - API works for trading!")
+else:
+    err = d.get("error", {}) if d else {}
+    log("\nFAIL - Order rejected!")
+    if isinstance(err, dict):
+        log("Code   : {}".format(err.get("code",    "?")))
+        log("Detail : {}".format(err.get("context", "?")))
+    else:
+        log("Error  : {}".format(err))
 
-    # ── STEP 7: Cancel immediately ───────────
-    log("\n  STEP 6: Cancelling test order immediately...")
+# STEP 7: Cancel Order
+if order_id:
+    log("\n--- STEP 7: Cancel Test Order ---")
     time.sleep(2)
     c = http_delete("/v2/orders/{}".format(order_id), {
         "product_id": pid
     })
-    log("  Cancel response: {}".format(c))
     if c and c.get("success"):
-        log("  [SUCCESS] Order cancelled. No real trade placed.")
+        log("Order cancelled. No real trade placed. PASS")
     else:
-        log("  [WARN] Could not cancel. Check Delta app and cancel manually!")
-        log("  Order ID to cancel: {}".format(order_id))
-else:
-    error = d.get("error", {})
-    code  = error.get("code", "unknown") if isinstance(error, dict) else error
-    msg   = error.get("context", "") if isinstance(error, dict) else ""
-    log("\n  [FAILED] Order placement failed!")
-    log("  Error code : {}".format(code))
-    log("  Message    : {}".format(msg))
-    log("  Full error : {}".format(d))
+        log("WARN: Auto-cancel failed!")
+        log("Cancel manually on Delta app! Order ID: {}".format(order_id))
 
+# SUMMARY
 log("\n" + "=" * 60)
-log("  TEST COMPLETE")
-log("  Share the output above and we will fix any issues.")
-time.sleep(30)  # keeps container alive so you can read logs
+log("  RESULT SUMMARY")
 log("=" * 60)
+log("  1. API Keys   : PASS")
+log("  2. Price feed : ${} PASS".format(price))
+log("  3. Product ID : {} PASS".format(pid))
+log("  4. Leverage   : 50x")
+log("  5. Order      : {}".format("PASS" if order_id else "FAIL"))
+log("=" * 60)
+log("  Staying alive 90s - screenshot these logs now!")
+log("=" * 60)
+
+for i in range(18):
+    time.sleep(5)
+    remaining = 90 - (i + 1) * 5
+    log("  Closing in {}s...".format(remaining))
